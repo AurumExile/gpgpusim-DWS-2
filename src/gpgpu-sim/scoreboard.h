@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <set>
+#include <map>     
 #include <vector>
 #include "assert.h"
 
@@ -43,7 +44,9 @@ class Scoreboard {
 
   void reserveRegisters(const warp_inst_t *inst);
   void releaseRegisters(const warp_inst_t *inst);
-  void releaseRegister(unsigned wid, unsigned regnum);
+  
+  // DWS: Modified to include the mask so we know which threads are releasing
+  void releaseRegister(unsigned wid, unsigned regnum, const active_mask_t &mask);
 
   bool checkCollision(unsigned wid, const inst_t *inst) const;
   bool pendingWrites(unsigned wid) const;
@@ -51,16 +54,16 @@ class Scoreboard {
   const bool islongop(unsigned warp_id, unsigned regnum);
 
  private:
-  void reserveRegister(unsigned wid, unsigned regnum);
+  // DWS: Modified to include the mask of threads reserving the register
+  void reserveRegister(unsigned wid, unsigned regnum, const active_mask_t &mask);
+  
   int get_sid() const { return m_sid; }
-
   unsigned m_sid;
 
-  // keeps track of pending writes to registers
-  // indexed by warp id, reg_id => pending write count
-  std::vector<std::set<unsigned> > reg_table;
-  // Register that depend on a long operation (global, local or tex memory)
-  std::vector<std::set<unsigned> > longopregs;
+  // DWS: REPLACE std::set with std::map<unsigned, active_mask_t>
+  // indexed by warp id -> (reg_id => active_mask_t of locking threads)
+  std::vector<std::map<unsigned, active_mask_t> > reg_table;
+  std::vector<std::map<unsigned, active_mask_t> > longopregs;
 
   class gpgpu_t *m_gpu;
 };

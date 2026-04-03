@@ -1095,8 +1095,13 @@ class warp_inst_t : public inst_t {
     m_is_depbar = false;
 
     m_depbar_group_no = 0;
+    m_split_id = 0;
   }
   virtual ~warp_inst_t() {}
+
+  //DWS: get and sets
+  unsigned get_split_id() const { return m_split_id; }
+  void set_split_id(unsigned id) { m_split_id = id; }
 
   // modifiers
   void broadcast_barrier_reduction(const active_mask_t &access_mask);
@@ -1276,6 +1281,7 @@ class warp_inst_t : public inst_t {
   std::list<mem_access_t> m_accessq;
 
   unsigned m_scheduler_id;  // the scheduler that issues this inst
+  unsigned m_split_id; // DWS: Track which split owns this instruction
 
   // Jin: cdp support
  public:
