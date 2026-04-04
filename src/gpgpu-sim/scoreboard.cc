@@ -9,8 +9,10 @@
 Scoreboard::Scoreboard(unsigned sid, unsigned n_warps, class gpgpu_t* gpu)
     : longopregs() {
   m_sid = sid;
+  // Initialize size of table
   reg_table.resize(n_warps);
   longopregs.resize(n_warps);
+
   m_gpu = gpu;
 }
 
@@ -74,6 +76,8 @@ void Scoreboard::reserveRegisters(const class warp_inst_t* inst) {
   for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
     if (inst->out[r] > 0) {
       reserveRegister(inst->warp_id(), inst->out[r], mask);
+      SHADER_DPRINTF(SCOREBOARD, "Reserved register - warp:%d, reg: %d, mask: %d\n",
+                     inst->warp_id(), inst->out[r], mask);
     }
   }
 
