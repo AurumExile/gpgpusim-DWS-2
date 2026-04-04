@@ -176,16 +176,17 @@ class shd_warp_t {
   }
 
   // DWS: Helper to create or update a sub-warp
-  void spawn_split(unsigned split_id, address_type start_pc,
-                   const std::bitset<MAX_WARP_SIZE> &active) {
+  void spawn_split(unsigned split_id, address_type start_pc, const std::bitset<MAX_WARP_SIZE> &active) {
+    warp_split_t split;
+    split.split_id = split_id;
+    split.pc = start_pc;
+    split.active_threads = active;
+    split.is_valid = true;
+    split.waiting_on_memory = false;
     if (m_splits.size() <= split_id) {
-      m_splits.resize(split_id + 1);
+      m_splits.resize(split_id + 1);// resize call here is terrible, consider a 2x size increase instead, or some sort of emplacing system.
     }
-    m_splits[split_id].split_id = split_id;
-    m_splits[split_id].pc = start_pc;
-    m_splits[split_id].active_threads = active;
-    m_splits[split_id].is_valid = true;
-    m_splits[split_id].waiting_on_memory = false;
+    m_splits[split_id] = split;
   }
 
   void init(address_type start_pc, unsigned cta_id, unsigned wid,
