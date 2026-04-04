@@ -103,12 +103,13 @@ class thread_ctx_t {
 // New Warp split container
 struct warp_split_t {
   unsigned split_id;
-  address_type pc;                           // The Program Counter for this specific split
-  std::bitset<MAX_WARP_SIZE> active_threads; // The threads active in this split
-  bool is_valid;                             // True if this split is currently alive
-  bool waiting_on_memory;                    // True if this split is stalled on a cache miss
+  address_type pc;  // The Program Counter for this specific split
+  std::bitset<MAX_WARP_SIZE>
+      active_threads;      // The threads active in this split
+  bool is_valid;           // True if this split is currently alive
+  bool waiting_on_memory;  // True if this split is stalled on a cache miss
 
-  warp_split_t() 
+  warp_split_t()
       : split_id(0), pc(0), is_valid(false), waiting_on_memory(false) {}
 };
 
@@ -121,7 +122,24 @@ class shd_warp_t {
     m_inst_in_pipeline = 0;
     reset();
   }
-  
+
+  unsigned ibuffer_get_size() const { return IBUFFER_SIZE; }
+
+  bool ibuffer_is_valid(unsigned slot) const {
+    assert(slot < IBUFFER_SIZE);
+    return m_ibuffer[slot].m_valid;
+  }
+
+  unsigned ibuffer_get_split(unsigned slot) const {
+    assert(slot < IBUFFER_SIZE);
+    return m_ibuffer[slot].m_split_id;
+  }
+
+  const warp_inst_t *ibuffer_get_inst(unsigned slot) const {
+    assert(slot < IBUFFER_SIZE);
+    return m_ibuffer[slot].m_inst;
+  }
+
   void reset() {
     assert(m_stores_outstanding == 0);
     assert(m_inst_in_pipeline == 0);
@@ -138,6 +156,8 @@ class shd_warp_t {
 
     // DWS: Clear all sub-warps on reset
     m_splits.clear();
+    m_splits.resize(1);
+    m_splits[0].is_valid = true;
 
     // Jin: cdp support
     m_cdp_latency = 0;
@@ -156,7 +176,8 @@ class shd_warp_t {
   }
 
   // DWS: Helper to create or update a sub-warp
-  void spawn_split(unsigned split_id, address_type start_pc, const std::bitset<MAX_WARP_SIZE> &active) {
+  void spawn_split(unsigned split_id, address_type start_pc,
+                   const std::bitset<MAX_WARP_SIZE> &active) {
     if (m_splits.size() <= split_id) {
       m_splits.resize(split_id + 1);
     }
@@ -174,7 +195,7 @@ class shd_warp_t {
     m_cta_id = cta_id;
     m_warp_id = wid;
     m_dynamic_warp_id = dynamic_warp_id;
-    
+
     assert(n_completed >= active.count());
     assert(n_completed <= m_warp_size);
     n_completed -= active.count();  // active threads are not yet completed
@@ -211,11 +232,12 @@ class shd_warp_t {
   void print_ibuffer(FILE *fout) const;
 
   unsigned get_n_completed() const { return n_completed; }
-  
-  // DWS: Thread completion now loops through splits to find where the thread belongs
+
+  // DWS: Thread completion now loops through splits to find where the thread
+  // belongs
   void set_completed(unsigned lane) {
     bool found = false;
-    for (auto& split : m_splits) {
+    for (auto &split : m_splits) {
       if (split.is_valid && split.active_threads.test(lane)) {
         split.active_threads.reset(lane);
         found = true;
@@ -226,8 +248,8 @@ class shd_warp_t {
   }
 
   // DWS: Check if lane is active in ANY split
-  bool test_active(unsigned lane) { 
-    for (const auto& split : m_splits) {
+  bool test_active(unsigned lane) {
+    for (const auto &split : m_splits) {
       if (split.is_valid && split.active_threads.test(lane)) return true;
     }
     return false;
@@ -246,26 +268,33 @@ class shd_warp_t {
   bool get_membar() const { return m_membar; }
 
   // DWS: Legacy fallback for non-diverged code. Returns Split 0.
-  virtual address_type get_pc() const { 
-      assert(m_splits.size() > 0 && m_splits[0].is_valid);
-      return m_splits[0].pc; 
+  virtual address_type get_pc() const {
+    assert(m_splits.size() > 0 && m_splits[0].is_valid);
+    return m_splits[0].pc;
   }
   // DWS: New signature for split-aware execution
   virtual address_type get_pc(unsigned split_id) const {
-      assert(split_id < m_splits.size() && m_splits[split_id].is_valid);
-      return m_splits[split_id].pc;
+    assert(split_id < m_splits.size() && m_splits[split_id].is_valid);
+    return m_splits[split_id].pc;
   }
 
   // DWS: Legacy fallback
-  void set_next_pc(address_type pc) { 
-      if(m_splits.size() > 0 && m_splits[0].is_valid) m_splits[0].pc = pc; 
+  void set_next_pc(address_type pc) {
+    if (m_splits.size() > 0 && m_splits[0].is_valid) m_splits[0].pc = pc;
   }
   // DWS: New signature for split-aware execution
   void set_next_pc(unsigned split_id, address_type pc) {
-      fprintf(stderr, "DEBUG DWS: Warp %d, split_id %d, m_splits size %zu\n", m_warp_id, split_id, m_splits.size());
-      fflush(stderr);
-      assert(split_id < m_splits.size() && m_splits[split_id].is_valid);
-      m_splits[split_id].pc = pc;
+    fprintf(stderr, "DEBUG DWS: Warp %d, split_id %d, m_splits size %zu\n",
+            m_warp_id, split_id, m_splits.size());
+    fflush(stderr);
+    fprintf(stderr, "\n--- DWS CRASH REPORT ---\n");
+    fprintf(stderr, "Warp ID: %d\n", m_warp_id);
+    fprintf(stderr, "Split ID requested: %u\n", split_id);
+    fprintf(stderr, "Current m_splits size: %zu\n", m_splits.size());
+    fprintf(stderr, "------------------------\n\n");
+    fflush(stderr);  // Force it to the screen instantly
+    assert(split_id < m_splits.size() && m_splits[split_id].is_valid);
+    m_splits[split_id].pc = pc;
   }
 
   virtual kernel_info_t *get_kernel_info() const;
@@ -278,7 +307,8 @@ class shd_warp_t {
   }
 
   // DWS: IBuffer now requires knowing WHICH split the instruction belongs to
-  void ibuffer_fill(unsigned slot, const warp_inst_t *pI, unsigned split_id = 0) {
+  void ibuffer_fill(unsigned slot, const warp_inst_t *pI,
+                    unsigned split_id = 0) {
     assert(slot < IBUFFER_SIZE);
     m_ibuffer[slot].m_inst = pI;
     m_ibuffer[slot].m_valid = true;
@@ -299,14 +329,16 @@ class shd_warp_t {
   }
   const warp_inst_t *ibuffer_next_inst() { return m_ibuffer[m_next].m_inst; }
   bool ibuffer_next_valid() { return m_ibuffer[m_next].m_valid; }
-  
+
   // DWS: Ask the ibuffer which split owns the next instruction
   unsigned ibuffer_next_split() { return m_ibuffer[m_next].m_split_id; }
 
-  void ibuffer_free() {
-    m_ibuffer[m_next].m_inst = NULL;
-    m_ibuffer[m_next].m_valid = false;
+  void ibuffer_free(unsigned slot) {
+    assert(slot < IBUFFER_SIZE);
+    m_ibuffer[slot].m_inst = NULL;
+    m_ibuffer[slot].m_valid = false;
   }
+
   void ibuffer_step() { m_next = (m_next + 1) % IBUFFER_SIZE; }
 
   bool imiss_pending() const { return m_imiss_pending; }
@@ -344,9 +376,7 @@ class shd_warp_t {
   unsigned get_dynamic_warp_id() const { return m_dynamic_warp_id; }
   unsigned get_warp_id() const { return m_warp_id; }
 
-  class shader_core_ctx *get_shader() {
-    return m_shader;
-  }
+  class shader_core_ctx *get_shader() { return m_shader; }
 
   // DWS: Exposed container so the Scheduler can iterate over splits
   std::vector<warp_split_t> m_splits;
@@ -371,11 +401,11 @@ class shd_warp_t {
     ibuffer_entry() {
       m_valid = false;
       m_inst = NULL;
-      m_split_id = 0; 
+      m_split_id = 0;
     }
     const warp_inst_t *m_inst;
     bool m_valid;
-    unsigned m_split_id; // DWS: Tracks which split owns this instruction
+    unsigned m_split_id;  // DWS: Tracks which split owns this instruction
   };
 
   warp_inst_t m_inst_at_barrier;
@@ -385,11 +415,11 @@ class shd_warp_t {
   unsigned m_n_atomic;  // number of outstanding atomic operations
   bool m_membar;        // if true, warp is waiting at memory barrier
 
-  bool m_done_exit;  
+  bool m_done_exit;
 
   unsigned long long m_last_fetch;
 
-  unsigned m_stores_outstanding;  
+  unsigned m_stores_outstanding;
   unsigned m_inst_in_pipeline;
 
   // Jin: cdp support
@@ -399,11 +429,11 @@ class shd_warp_t {
 
   // Ni: LDGDEPBAR barrier support
  public:
-  unsigned int m_ldgdepbar_id;  
-  std::vector<std::vector<warp_inst_t>> m_ldgdepbar_buf;  
+  unsigned int m_ldgdepbar_id;
+  std::vector<std::vector<warp_inst_t>> m_ldgdepbar_buf;
   unsigned int m_depbar_start_id;
   unsigned int m_depbar_group;
-  bool m_waiting_ldgsts;  
+  bool m_waiting_ldgsts;
 };
 
 inline unsigned hw_tid_from_wid(unsigned wid, unsigned warp_size, unsigned i) {
@@ -2137,9 +2167,9 @@ class shader_core_ctx : public core_t {
                   const shader_core_config *config,
                   const memory_config *mem_config, shader_core_stats *stats);
 
-    std::vector<shd_warp_t *> m_warp;  // per warp information array
-  
-                  // used by simt_core_cluster:
+  std::vector<shd_warp_t *> m_warp;  // per warp information array
+
+  // used by simt_core_cluster:
   // modifiers
   void cycle();
   void reinit(unsigned start_thread, unsigned end_thread,
@@ -2545,13 +2575,11 @@ class shader_core_ctx : public core_t {
 
   virtual void create_shd_warp() = 0;
 
-  virtual const warp_inst_t *get_next_inst(unsigned warp_id,
-                                           unsigned split_id,
+  virtual const warp_inst_t *get_next_inst(unsigned warp_id, unsigned split_id,
                                            address_type pc) = 0;
-  virtual void get_pdom_stack_top_info(unsigned warp_id, 
-                                       unsigned split_id,
-                                       const warp_inst_t *pI,
-                                       unsigned *pc, unsigned *rpc) = 0;
+  virtual void get_pdom_stack_top_info(unsigned warp_id, unsigned split_id,
+                                       const warp_inst_t *pI, unsigned *pc,
+                                       unsigned *rpc) = 0;
   virtual const active_mask_t &get_active_mask(unsigned warp_id,
                                                unsigned split_id,
                                                const warp_inst_t *pI) = 0;
@@ -2675,7 +2703,7 @@ class exec_shader_core_ctx : public shader_core_ctx {
   virtual void checkExecutionStatusAndUpdate(warp_inst_t &inst, unsigned t,
                                              unsigned tid);
   virtual void func_exec_inst(warp_inst_t &inst);
-  
+
   // Initialization
   virtual unsigned sim_init_thread(kernel_info_t &kernel,
                                    ptx_thread_info **thread_info, int sid,
@@ -2683,20 +2711,18 @@ class exec_shader_core_ctx : public shader_core_ctx {
                                    unsigned num_threads, core_t *core,
                                    unsigned hw_cta_id, unsigned hw_warp_id,
                                    gpgpu_t *gpu);
-                                   
+
   virtual void create_shd_warp();
 
   // DWS-Aligned Control Flow Signatures
   // Note: We removed '= 0' because this class MUST provide an implementation.
-  virtual const warp_inst_t *get_next_inst(unsigned warp_id, 
-                                           unsigned split_id, 
+  virtual const warp_inst_t *get_next_inst(unsigned warp_id, unsigned split_id,
                                            address_type pc);
-                                           
-  virtual void get_pdom_stack_top_info(unsigned warp_id, 
-                                       unsigned split_id,
-                                       const warp_inst_t *pI,
-                                       unsigned *pc, unsigned *rpc);
-                                       
+
+  virtual void get_pdom_stack_top_info(unsigned warp_id, unsigned split_id,
+                                       const warp_inst_t *pI, unsigned *pc,
+                                       unsigned *rpc);
+
   virtual const active_mask_t &get_active_mask(unsigned warp_id,
                                                unsigned split_id,
                                                const warp_inst_t *pI);

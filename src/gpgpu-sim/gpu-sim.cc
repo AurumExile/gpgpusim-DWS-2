@@ -1974,10 +1974,10 @@ void gpgpu_sim::cycle() {
   int clock_mask = next_clock_domain();
 
   static long long total_cycles = 0;
-    if (total_cycles % 100 == 0) {
-        printf("[HEARTBEAT] Simulating Cycle %lld...\n", total_cycles);
-    }
-    total_cycles++;
+  if (total_cycles % 100 == 0) {
+    printf("[HEARTBEAT] Simulating Cycle %lld...\n", total_cycles);
+  }
+  total_cycles++;
 
   if (clock_mask & CORE) {
     // shader core loading (pop from ICNT into core) follows CORE clock
@@ -2103,7 +2103,7 @@ void gpgpu_sim::cycle() {
 
     if (g_interactive_debugger_enabled) gpgpu_debug();
 
-      // McPAT main cycle (interface with McPAT)
+    // McPAT main cycle (interface with McPAT)
 #ifdef GPGPUSIM_POWER_MODEL
     if (m_config.g_power_simulation_enabled) {
       if (m_config.g_power_simulation_mode == 0) {
@@ -2350,7 +2350,7 @@ void sst_gpgpu_sim::SST_cycle() {
   gpu_sim_cycle++;
   if (g_interactive_debugger_enabled) gpgpu_debug();
 
-    // McPAT main cycle (interface with McPAT)
+  // McPAT main cycle (interface with McPAT)
 #ifdef GPGPUSIM_POWER_MODEL
   if (m_config.g_power_simulation_enabled) {
     mcpat_cycle(m_config, getShaderCoreConfig(), m_gpgpusim_wrapper,

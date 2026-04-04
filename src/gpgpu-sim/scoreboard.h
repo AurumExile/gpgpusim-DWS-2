@@ -28,8 +28,8 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <map>
 #include <set>
-#include <map>     
 #include <vector>
 #include "assert.h"
 
@@ -44,9 +44,10 @@ class Scoreboard {
 
   void reserveRegisters(const warp_inst_t *inst);
   void releaseRegisters(const warp_inst_t *inst);
-  
+
   // DWS: Modified to include the mask so we know which threads are releasing
-  void releaseRegister(unsigned wid, unsigned regnum, const active_mask_t &mask);
+  void releaseRegister(unsigned wid, unsigned regnum,
+                       const active_mask_t &mask);
 
   bool checkCollision(unsigned wid, const inst_t *inst) const;
   bool pendingWrites(unsigned wid) const;
@@ -55,8 +56,9 @@ class Scoreboard {
 
  private:
   // DWS: Modified to include the mask of threads reserving the register
-  void reserveRegister(unsigned wid, unsigned regnum, const active_mask_t &mask);
-  
+  void reserveRegister(unsigned wid, unsigned regnum,
+                       const active_mask_t &mask);
+
   int get_sid() const { return m_sid; }
   unsigned m_sid;
 
