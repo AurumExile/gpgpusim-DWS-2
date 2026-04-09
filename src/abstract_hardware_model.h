@@ -1088,10 +1088,13 @@ class warp_inst_t : public inst_t {
     m_split_id = 0;
   }
   virtual ~warp_inst_t() {}
+  
 
   // DWS: get and sets
   unsigned get_split_id() const { return m_split_id; }
   void set_split_id(unsigned id) { m_split_id = id; }
+  void set_warp_id(unsigned wid) { m_warp_id = wid; }
+  void set_scheduler_id(unsigned id) { m_scheduler_id = id; }
 
   // modifiers
   void broadcast_barrier_reduction(const active_mask_t &access_mask);

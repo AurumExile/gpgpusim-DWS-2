@@ -1974,10 +1974,6 @@ void gpgpu_sim::cycle() {
   int clock_mask = next_clock_domain();
 
   static long long total_cycles = 0;
-  if (total_cycles % 100 == 0) {
-    printf("[HEARTBEAT] Simulating Cycle %lld...\n", total_cycles);
-  }
-  total_cycles++;
 
   if (clock_mask & CORE) {
     // shader core loading (pop from ICNT into core) follows CORE clock

@@ -104,6 +104,7 @@ class thread_ctx_t {
 struct warp_split_t {
   unsigned split_id;
   address_type pc;  // The Program Counter for this specific split
+  unsigned trace_index;
   std::bitset<MAX_WARP_SIZE>
       active_threads;      // The threads active in this split
   bool is_valid;           // True if this split is currently alive
@@ -113,7 +114,7 @@ struct warp_split_t {
       : split_id(0), pc(0), is_valid(false), waiting_on_memory(false) {}
 };
 
-// OVERHAULED shd_warp_t CLASS
+// DWS OVERHAULED shd_warp_t CLASS
 class shd_warp_t {
  public:
   shd_warp_t(class shader_core_ctx *shader, unsigned warp_size)
@@ -121,6 +122,14 @@ class shd_warp_t {
     m_stores_outstanding = 0;
     m_inst_in_pipeline = 0;
     reset();
+  }
+
+  std::bitset<MAX_WARP_SIZE> get_active_mask() const {
+    std::bitset<MAX_WARP_SIZE> mask;
+    for (const auto &split : m_splits) {
+      if (split.is_valid) mask |= split.active_threads;
+    }
+    return mask;
   }
 
   unsigned ibuffer_get_size() const { return IBUFFER_SIZE; }
@@ -176,15 +185,18 @@ class shd_warp_t {
   }
 
   // DWS: Helper to create or update a sub-warp
-  void spawn_split(unsigned split_id, address_type start_pc, const std::bitset<MAX_WARP_SIZE> &active) {
+  void spawn_split(unsigned split_id, address_type start_pc, unsigned trace_idx,
+                   const std::bitset<MAX_WARP_SIZE> &active) {
     warp_split_t split;
     split.split_id = split_id;
     split.pc = start_pc;
+    split.trace_index = trace_idx;  // This is the new parameter
     split.active_threads = active;
     split.is_valid = true;
     split.waiting_on_memory = false;
+
     if (m_splits.size() <= split_id) {
-      m_splits.resize(split_id + 1);// resize call here is terrible, consider a 2x size increase instead, or some sort of emplacing system.
+      m_splits.resize(split_id + 1);
     }
     m_splits[split_id] = split;
   }
@@ -192,6 +204,8 @@ class shd_warp_t {
   void init(address_type start_pc, unsigned cta_id, unsigned wid,
             const std::bitset<MAX_WARP_SIZE> &active, unsigned dynamic_warp_id,
             unsigned long long streamID) {
+
+              assert(m_inst_in_pipeline == 0 && "Warp init called while instructions still in pipeline!");
     m_streamID = streamID;
     m_cta_id = cta_id;
     m_warp_id = wid;
@@ -199,18 +213,18 @@ class shd_warp_t {
 
     assert(n_completed >= active.count());
     assert(n_completed <= m_warp_size);
-    n_completed -= active.count();  // active threads are not yet completed
+    n_completed -= active.count();
     m_done_exit = false;
 
-    // DWS: Initialize Split 0 as the primary monolithic warp at launch
+    // DWS: Wipe old splits and start fresh with Split 0
     m_splits.clear();
-    spawn_split(0, start_pc, active);
+    // Start Split 0 with the index 0 (will be translated to memory address
+    // later)
+    spawn_split(0, start_pc, 0, active);
 
-    // Jin: cdp support
     m_cdp_latency = 0;
     m_cdp_dummy = false;
 
-    // Ni: Initialize ldgdepbar_id
     m_ldgdepbar_id = 0;
     m_depbar_start_id = 0;
     m_depbar_group = 0;
@@ -270,9 +284,12 @@ class shd_warp_t {
 
   // DWS: Legacy fallback for non-diverged code. Returns Split 0.
   virtual address_type get_pc() const {
-    assert(m_splits.size() > 0 && m_splits[0].is_valid);
-    return m_splits[0].pc;
+    if (m_splits.size() > 0 && m_splits[0].is_valid) {
+      return m_splits[0].pc;
+    }
+    return 0;  // Return safe 0 instead of asserting
   }
+
   // DWS: New signature for split-aware execution
   virtual address_type get_pc(unsigned split_id) const {
     assert(split_id < m_splits.size() && m_splits[split_id].is_valid);
@@ -285,15 +302,6 @@ class shd_warp_t {
   }
   // DWS: New signature for split-aware execution
   void set_next_pc(unsigned split_id, address_type pc) {
-    fprintf(stderr, "DEBUG DWS: Warp %d, split_id %d, m_splits size %zu\n",
-            m_warp_id, split_id, m_splits.size());
-    fflush(stderr);
-    fprintf(stderr, "\n--- DWS CRASH REPORT ---\n");
-    fprintf(stderr, "Warp ID: %d\n", m_warp_id);
-    fprintf(stderr, "Split ID requested: %u\n", split_id);
-    fprintf(stderr, "Current m_splits size: %zu\n", m_splits.size());
-    fprintf(stderr, "------------------------\n\n");
-    fflush(stderr);  // Force it to the screen instantly
     assert(split_id < m_splits.size() && m_splits[split_id].is_valid);
     m_splits[split_id].pc = pc;
   }
@@ -323,7 +331,9 @@ class shd_warp_t {
   }
   void ibuffer_flush() {
     for (unsigned i = 0; i < IBUFFER_SIZE; i++) {
-      if (m_ibuffer[i].m_valid) dec_inst_in_pipeline();
+      if (m_ibuffer[i].m_valid) {
+          dec_inst_in_pipeline();
+      }
       m_ibuffer[i].m_inst = NULL;
       m_ibuffer[i].m_valid = false;
     }
@@ -338,6 +348,7 @@ class shd_warp_t {
     assert(slot < IBUFFER_SIZE);
     m_ibuffer[slot].m_inst = NULL;
     m_ibuffer[slot].m_valid = false;
+    m_ibuffer[slot].m_split_id = 0;
   }
 
   void ibuffer_step() { m_next = (m_next + 1) % IBUFFER_SIZE; }
@@ -365,11 +376,8 @@ class shd_warp_t {
     return (num_inst_in_pipeline() - num_inst_in_buffer());
   }
   bool inst_in_pipeline() const { return m_inst_in_pipeline > 0; }
-  void inc_inst_in_pipeline() { m_inst_in_pipeline++; }
-  void dec_inst_in_pipeline() {
-    assert(m_inst_in_pipeline > 0);
-    m_inst_in_pipeline--;
-  }
+  void inc_inst_in_pipeline();
+  void dec_inst_in_pipeline();
 
   unsigned long long get_streamID() const { return m_streamID; }
   unsigned get_cta_id() const { return m_cta_id; }

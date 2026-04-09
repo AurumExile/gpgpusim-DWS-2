@@ -52,7 +52,7 @@ class Scoreboard {
   bool checkCollision(unsigned wid, const inst_t *inst) const;
   bool pendingWrites(unsigned wid) const;
   void printContents() const;
-  const bool islongop(unsigned warp_id, unsigned regnum);
+  const bool islongop(unsigned warp_id, unsigned regnum, const active_mask_t &mask);
 
  private:
   // DWS: Modified to include the mask of threads reserving the register
