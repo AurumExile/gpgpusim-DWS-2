@@ -1195,6 +1195,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
       }
     }
   }
+  func_exec_inst(**pipe_reg);
 }
 void shader_core_ctx::issue() {
   // Ensure fair round robin issu between schedulers
