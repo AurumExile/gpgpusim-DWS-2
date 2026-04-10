@@ -902,21 +902,31 @@ void shader_core_ctx::decode() {
       for (unsigned s = 0; s < warp_ptr->m_splits.size(); s++) {
         warp_split_t &split = warp_ptr->m_splits[s];
         if (split.is_valid) {
-          printf("[LIFECYCLE-RETIRE] Warp %u | Split %u reached end of trace.\n", fetch_warp_id, s);
+          printf(
+              "[LIFECYCLE-RETIRE] Core: %u | Warp %u | Split %u reached end of "
+              "trace.\n",
+              m_sid, fetch_warp_id, s);
           for (unsigned t = 0; t < m_config->warp_size; t++) {
             if (split.active_threads.test(t)) warp_ptr->set_completed(t);
           }
           split.is_valid = false;
           split.active_threads.reset();
+          split.waiting_on_memory = false;
 
-          // THE TRAP FIX: Flush the I-Buffer specifically for THIS split
+          // Flush the I-Buffer specifically for THIS split
           for (unsigned slot = 0; slot < warp_ptr->ibuffer_get_size(); slot++) {
-            if (warp_ptr->ibuffer_is_valid(slot) && warp_ptr->ibuffer_get_split(slot) == s) {
-              warp_ptr->dec_inst_in_pipeline(); // Correct accounting for trapped inst
+            if (warp_ptr->ibuffer_is_valid(slot) &&
+                warp_ptr->ibuffer_get_split(slot) == s) {
+              warp_ptr->dec_inst_in_pipeline();  // Correct accounting for
+                                                 // trapped inst
               warp_ptr->ibuffer_free(slot);
             }
           }
         }
+      }
+
+      if (warp_ptr->functional_done()) {
+        m_barriers.warp_exit(fetch_warp_id); 
       }
       m_inst_fetch_buffer.m_valid = false;
       return;
@@ -954,15 +964,16 @@ void shader_core_ctx::decode() {
       }
 
       // Handle Dual Issue
-      const warp_inst_t *pI2 = get_next_inst(fetch_warp_id, fetch_split_id, pc + pI1->isize);
-      
+      const warp_inst_t *pI2 =
+          get_next_inst(fetch_warp_id, fetch_split_id, pc + pI1->isize);
+
       if (pI2) {
         m_warp[fetch_warp_id]->ibuffer_fill(1, pI2, fetch_split_id);
         m_warp[fetch_warp_id]->inc_inst_in_pipeline();
         m_stats->m_num_decoded_insn[m_sid]++;
-        
+
         // Added the missing stats tracking for the dual-issued instruction here
-        if ((pI2->oprnd_type == INT_OP) || (pI2->oprnd_type == UN_OP)) { 
+        if ((pI2->oprnd_type == INT_OP) || (pI2->oprnd_type == UN_OP)) {
           m_stats->m_num_INTdecoded_insn[m_sid]++;
         } else if (pI2->oprnd_type == FP_OP) {
           m_stats->m_num_FPdecoded_insn[m_sid]++;
@@ -1151,48 +1162,40 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
             continue;
           }
 
-          // SAFETY CHECK: Ensure Split J has no instructions pending in the
-          // I-Buffer
-          bool split_j_in_buffer = false;
+          // Merge threads into split i
+          m_warp[warp_id]->m_splits[i].active_threads |=
+              m_warp[warp_id]->m_splits[j].active_threads;
+
+          // --- DWS MERGE LOGGING ---
+          printf(
+              "[DWS-MERGE] Core: %u | Cycle: %llu | Warp: %u | Surviving "
+              "Split: %u | "
+              "Killed Split: %u | Merge PC: 0x%llx | Combined Mask: %s\n",
+              m_sid, m_gpu->gpu_sim_cycle, warp_id, i, j,
+              (unsigned long long)m_warp[warp_id]->m_splits[i].pc,
+              m_warp[warp_id]->m_splits[i].active_threads.to_string().c_str());
+
+          // Flush trapped instructions for the dying split J (The Zombie Killer
+          // + Shield)
           for (unsigned slot = 0; slot < m_warp[warp_id]->ibuffer_get_size();
                slot++) {
             if (m_warp[warp_id]->ibuffer_is_valid(slot) &&
-                m_warp[warp_id]->ibuffer_get_split(slot) == j) {
-              split_j_in_buffer = true;
-              break;
+                m_warp[warp_id]->ibuffer_get_split(slot) == j &&
+                m_warp[warp_id]->ibuffer_get_inst(slot) != next_inst) {
+              m_warp[warp_id]->dec_inst_in_pipeline();
+              m_warp[warp_id]->ibuffer_free(slot);
             }
           }
 
-          if (m_warp[warp_id]->m_splits[i].pc ==
-              m_warp[warp_id]->m_splits[j].pc) {
-            // 1. Always merge the threads immediately
-            m_warp[warp_id]->m_splits[i].active_threads |=
-                m_warp[warp_id]->m_splits[j].active_threads;
-
-            printf(
-                "[DWS-MERGE] Cycle: %llu | Warp: %u | Surviving Split: %u | "
-                "Killed Split: %u | "
-                "Merge PC: 0x%llx | Combined Mask: %s\n",
-                m_gpu->gpu_sim_cycle, warp_id, i, j,
-                m_warp[warp_id]->m_splits[i].pc,
-                m_warp[warp_id]
-                    ->m_splits[i]
-                    .active_threads.to_string()
-                    .c_str());
-
-            // 3. Now safely Garbage Collect Split J
-            m_warp[warp_id]->m_splits[j].is_valid = false;
-            m_warp[warp_id]
-                ->m_splits[j]
-                .active_threads.reset();          // Clear the mask
-            m_warp[warp_id]->m_splits[j].pc = 0;  // Wipe the PC
-          }
+          // Kill Split J and scrub its data
+          m_warp[warp_id]->m_splits[j].is_valid = false;
+          m_warp[warp_id]->m_splits[j].active_threads.reset();
+          m_warp[warp_id]->m_splits[j].pc = (address_type)-1;
         }
       }
     }
   }
 }
-
 void shader_core_ctx::issue() {
   // Ensure fair round robin issu between schedulers
   unsigned j;
