@@ -338,6 +338,11 @@ void shader_core_config::reg_options(class OptionParser *opp) {
                          " {<nsets>:<bsize>:<assoc>,<rep>:<wr>:<alloc>:<wr_"
                          "alloc>,<mshr>:<N>:<merge>,<mq>:<rf>}",
                          "8:128:5,L:R:m:N,F:128:4,128:2");
+  option_parser_register(opp, "-gpgpu_max_hw_splits", OPT_UINT32,
+                         &gpgpu_max_hw_splits,
+                         "Maximum number of active hardware splits per warp "
+                         "for Dynamic Warp Subdivision (default = 4)",
+                         "4");
   option_parser_register(
       opp, "-gpgpu_const_cache:l1", OPT_CSTR, &m_L1C_config.m_config_string,
       "per-shader L1 constant memory cache  (READ-ONLY) config "

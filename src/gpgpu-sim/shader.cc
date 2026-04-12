@@ -106,8 +106,15 @@ void shader_core_ctx::create_front_pipeline() {
       N_PIPELINE_STAGES + m_config->m_specialized_unit.size() * 2;
   m_pipeline_reg.reserve(total_pipeline_stages);
   for (int j = 0; j < N_PIPELINE_STAGES; j++) {
+    unsigned stage_width = m_config->pipe_widths[j];
+
+    // --- THE FIX: Expand the Writeback buffer to absorb DWS traffic jams ---
+    if (j == EX_WB) {
+      stage_width = 20;
+    }
+
     m_pipeline_reg.push_back(
-        register_set(m_config->pipe_widths[j], pipeline_stage_name_decode[j]));
+        register_set(stage_width, pipeline_stage_name_decode[j]));
   }
   for (unsigned j = 0; j < m_config->m_specialized_unit.size(); j++) {
     m_pipeline_reg.push_back(
@@ -461,7 +468,7 @@ void shader_core_ctx::create_exec_pipeline() {
          m_fu.size() == m_issue_port.size());
 
   // there are as many result buses as the width of the EX_WB stage
-  num_result_bus = m_config->pipe_widths[EX_WB];
+  num_result_bus = 20;
   for (unsigned i = 0; i < num_result_bus; i++) {
     this->m_result_bus.push_back(new std::bitset<MAX_ALU_LATENCY>());
   }
@@ -889,56 +896,100 @@ const active_mask_t &exec_shader_core_ctx::get_active_mask(
 }
 
 void shader_core_ctx::decode() {
-  if (m_inst_fetch_buffer.m_valid) {
-    address_type pc = m_inst_fetch_buffer.m_pc;
-    unsigned fetch_warp_id = m_inst_fetch_buffer.m_warp_id;
+  // --- 1. DWS REAPER ---
+  for (unsigned w = 0; w < m_config->max_warps_per_shader; w++) {
+    shd_warp_t *warp_ptr = m_warp[w];
+    if (warp_ptr->done_exit()) continue;
 
-    // ---------------------------------------------------------
-    // 1. DWS End-of-Trace Retirement Logic
-    // ---------------------------------------------------------
-    // If PC is -1, the fetch unit reached the end of the trace.
-    if (pc == (address_type)-1) {
-      shd_warp_t *warp_ptr = m_warp[fetch_warp_id];
-      for (unsigned s = 0; s < warp_ptr->m_splits.size(); s++) {
-        warp_split_t &split = warp_ptr->m_splits[s];
-        if (split.is_valid) {
+    bool split_was_killed = false;
+
+    for (unsigned s = 0; s < warp_ptr->m_splits.size(); s++) {
+      if (warp_ptr->is_split_finished(s) &&
+          warp_ptr->is_split_pipeline_empty(s)) {
+        printf(
+            "[LIFECYCLE-RETIRE] Core: %u | Warp %u | Split %u reached end of "
+            "trace.\n",
+            m_sid, w, s);
+
+        for (unsigned t = 0; t < m_config->warp_size; t++) {
+          if (warp_ptr->m_splits[s].active_threads.test(t))
+            warp_ptr->set_completed(t);
+        }
+
+        warp_ptr->m_splits[s].is_valid = false;
+        warp_ptr->m_splits[s].active_threads.reset();
+        warp_ptr->m_splits[s].waiting_on_memory = false;
+        warp_ptr->m_splits[s].at_barrier = false;
+
+        split_was_killed = true;
+
+        if (!warp_ptr->m_pending_splits.empty()) {
+          warp_split_t queued = warp_ptr->m_pending_splits.front();
+          warp_ptr->m_pending_splits.pop();
+          warp_ptr->spawn_split(s, queued.pc, queued.trace_index,
+                                queued.active_threads);
           printf(
-              "[LIFECYCLE-RETIRE] Core: %u | Warp %u | Split %u reached end of "
-              "trace.\n",
-              m_sid, fetch_warp_id, s);
-          for (unsigned t = 0; t < m_config->warp_size; t++) {
-            if (split.active_threads.test(t)) warp_ptr->set_completed(t);
-          }
-          split.is_valid = false;
-          split.active_threads.reset();
-          split.waiting_on_memory = false;
+              "[DWS-WAKE] Core: %u | Cycle: %llu | Warp: %u popped queued "
+              "split into slot %u.\n",
+              m_sid, m_gpu->gpu_sim_cycle, w, s);
+        }
+      }
+    }
 
-          // Flush the I-Buffer specifically for THIS split
-          for (unsigned slot = 0; slot < warp_ptr->ibuffer_get_size(); slot++) {
-            if (warp_ptr->ibuffer_is_valid(slot) &&
-                warp_ptr->ibuffer_get_split(slot) == s) {
-              warp_ptr->dec_inst_in_pipeline();  // Correct accounting for
-                                                 // trapped inst
-              warp_ptr->ibuffer_free(slot);
-            }
+    // --- THE FIX: Re-evaluate Barrier if a split died ---
+    if (split_was_killed) {
+      bool warp_is_parked = false;
+      bool ready_for_barrier = true;
+      address_type parked_pc = (address_type)-1;
+
+      for (const auto &s : warp_ptr->m_splits) {
+        if (s.is_valid) {
+          if (s.at_barrier) {
+            warp_is_parked = true;
+            parked_pc = s.pc;
+          } else {
+            ready_for_barrier =
+                false;  // An active split is still not at the barrier
           }
         }
       }
 
-      if (warp_ptr->functional_done()) {
-        m_barriers.warp_exit(fetch_warp_id); 
+      if (warp_is_parked && ready_for_barrier &&
+          warp_ptr->m_pending_splits.empty()) {
+        for (auto &s : warp_ptr->m_splits) {
+          s.at_barrier = false;
+        }
+        // Fire a dummy instruction to satisfy the legacy barrier function
+        const warp_inst_t *parked_inst = m_warp[w]->get_inst_at_barrier();
+        assert(parked_inst != NULL);
+        m_barriers.warp_reaches_barrier(warp_ptr->get_cta_id(), w,
+                                        const_cast<warp_inst_t *>(parked_inst));
+
+        printf(
+            "[DWS-RELEASE] Core: %u | Warp: %u released barrier after laggard "
+            "death.\n",
+            m_sid, w);
       }
+    }
+    if (warp_ptr->functional_done()) {
+      m_barriers.warp_exit(w);
+    }
+  }
+
+  // --- 2. STANDARD DECODE ROUTING ---
+  if (m_inst_fetch_buffer.m_valid) {
+    address_type pc = m_inst_fetch_buffer.m_pc;
+    unsigned fetch_warp_id = m_inst_fetch_buffer.m_warp_id;
+
+    if (pc == (address_type)-1) {
       m_inst_fetch_buffer.m_valid = false;
       return;
     }
 
-    // ---------------------------------------------------------
-    // 2. DWS Split Identification
-    // ---------------------------------------------------------
-    unsigned fetch_split_id = 0;
-    // Find which split owns this memory address
+    unsigned fetch_split_id = (unsigned)-1;
     for (unsigned i = 0; i < m_warp[fetch_warp_id]->m_splits.size(); i++) {
-      if (m_warp[fetch_warp_id]->m_splits[i].is_valid) {
+      if (m_warp[fetch_warp_id]->m_splits[i].is_valid &&
+          !m_warp[fetch_warp_id]->m_splits[i].at_barrier) {
         address_type split_pc = m_warp[fetch_warp_id]->get_pc(i);
         if (split_pc == pc) {
           fetch_split_id = i;
@@ -947,11 +998,12 @@ void shader_core_ctx::decode() {
       }
     }
 
-    // ---------------------------------------------------------
-    // 3. Instruction Fetch & I-Buffer Fill
-    // ---------------------------------------------------------
-    const warp_inst_t *pI1 = get_next_inst(fetch_warp_id, fetch_split_id, pc);
+    if (fetch_split_id == (unsigned)-1) {
+      m_inst_fetch_buffer.m_valid = false;
+      return;
+    }
 
+    const warp_inst_t *pI1 = get_next_inst(fetch_warp_id, fetch_split_id, pc);
     if (pI1) {
       m_warp[fetch_warp_id]->ibuffer_fill(0, pI1, fetch_split_id);
       m_warp[fetch_warp_id]->inc_inst_in_pipeline();
@@ -963,16 +1015,13 @@ void shader_core_ctx::decode() {
         m_stats->m_num_FPdecoded_insn[m_sid]++;
       }
 
-      // Handle Dual Issue
       const warp_inst_t *pI2 =
           get_next_inst(fetch_warp_id, fetch_split_id, pc + pI1->isize);
-
       if (pI2) {
         m_warp[fetch_warp_id]->ibuffer_fill(1, pI2, fetch_split_id);
         m_warp[fetch_warp_id]->inc_inst_in_pipeline();
         m_stats->m_num_decoded_insn[m_sid]++;
 
-        // Added the missing stats tracking for the dual-issued instruction here
         if ((pI2->oprnd_type == INT_OP) || (pI2->oprnd_type == UN_OP)) {
           m_stats->m_num_INTdecoded_insn[m_sid]++;
         } else if (pI2->oprnd_type == FP_OP) {
@@ -980,8 +1029,6 @@ void shader_core_ctx::decode() {
         }
       }
     }
-
-    // Always invalidate the buffer so the Fetch Unit fetches again next cycle
     m_inst_fetch_buffer.m_valid = false;
   }
 }
@@ -1110,11 +1157,153 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   (*pipe_reg)->set_active(active_mask);
   (*pipe_reg)->set_scheduler_id(sch_id);
 
-  if (next_inst->op == BARRIER_OP) {
-    m_warp[warp_id]->store_info_of_last_inst_at_barrier(next_inst);
-    m_barriers.warp_reaches_barrier(m_warp[warp_id]->get_cta_id(), warp_id,
-                                    const_cast<warp_inst_t *>(next_inst));
+  // 1. Identify which split is physically issuing this instruction
+  unsigned issued_split_id = 0;
+  for (auto &split : m_warp[warp_id]->m_splits) {
+    // A parked split cannot issue. Filter it out to find the true owner.
+    if (split.is_valid && split.pc == next_inst->pc && !split.at_barrier) {
+      issued_split_id = split.split_id;
+      break;
+    }
+  }
 
+  // 2. Opportunistic Reconvergence Check (MUST happen BEFORE the barrier check)
+  if (m_warp[warp_id]->m_splits.size() > 1) {
+    for (unsigned i = 0; i < m_warp[warp_id]->m_splits.size(); i++) {
+      if (!m_warp[warp_id]->m_splits[i].is_valid) continue;
+
+      for (unsigned j = i + 1; j < m_warp[warp_id]->m_splits.size(); j++) {
+        if (!m_warp[warp_id]->m_splits[j].is_valid) continue;
+
+        // --- THE CRITICAL FIX: PC AND TRACE_INDEX MATCH ---
+        // This prevents merging a loop-back (future) with a laggard (past).
+        if (m_warp[warp_id]->m_splits[i].pc ==
+                m_warp[warp_id]->m_splits[j].pc &&
+            m_warp[warp_id]->m_splits[i].trace_index ==
+                m_warp[warp_id]->m_splits[j].trace_index) {
+          if (m_warp[warp_id]->m_splits[i].waiting_on_memory ||
+              m_warp[warp_id]->m_splits[j].waiting_on_memory) {
+            continue;
+          }
+
+          // Transfer identity if the issuing split (j) is the one being killed
+          if (issued_split_id == j) issued_split_id = i;
+
+          // Merge threads from J into I
+          m_warp[warp_id]->m_splits[i].active_threads |=
+              m_warp[warp_id]->m_splits[j].active_threads;
+
+          printf(
+              "[DWS-MERGE] Core: %u | Cycle: %llu | Warp: %u | Surviving: %u | "
+              "Killed: %u | PC: 0x%llx | TraceIdx: %llu\n",
+              m_sid, m_gpu->gpu_sim_cycle, warp_id, i, j,
+              (unsigned long long)m_warp[warp_id]->m_splits[i].pc,
+              (unsigned long long)m_warp[warp_id]->m_splits[i].trace_index);
+
+          // Zombie Killer: Clean I-Buffer of references to the killed split J
+          for (unsigned slot = 0; slot < m_warp[warp_id]->ibuffer_get_size();
+               slot++) {
+            if (m_warp[warp_id]->ibuffer_is_valid(slot) &&
+                m_warp[warp_id]->ibuffer_get_split(slot) == j &&
+                m_warp[warp_id]->ibuffer_get_inst(slot) != next_inst) {
+              m_warp[warp_id]->dec_inst_in_pipeline();
+              m_warp[warp_id]->ibuffer_free(slot);
+            }
+          }
+
+          // Kill Split J
+          m_warp[warp_id]->m_splits[j].is_valid = false;
+          m_warp[warp_id]->m_splits[j].active_threads.reset();
+          m_warp[warp_id]->m_splits[j].pc = (address_type)-1;
+          m_warp[warp_id]->m_splits[j].at_barrier = false;
+
+          // Wake-up logic for queued splits
+          if (!m_warp[warp_id]->m_pending_splits.empty()) {
+            warp_split_t queued = m_warp[warp_id]->m_pending_splits.front();
+            m_warp[warp_id]->m_pending_splits.pop();
+            m_warp[warp_id]->spawn_split(j, queued.pc, queued.trace_index,
+                                         queued.active_threads);
+            printf(
+                "[DWS-WAKE] Core: %u | Cycle: %llu | Warp: %u popped queued "
+                "split into slot %u.\n",
+                m_sid, m_gpu->gpu_sim_cycle, warp_id, j);
+          }
+
+          // --- THE FIX: Re-evaluate Barrier after a merge ---
+          bool warp_is_parked = false;
+          bool ready_for_barrier = true;
+          address_type parked_pc = (address_type)-1;
+
+          for (const auto &s : m_warp[warp_id]->m_splits) {
+            if (s.is_valid) {
+              if (s.at_barrier) {
+                warp_is_parked = true;
+                parked_pc = s.pc;
+              } else {
+                ready_for_barrier = false;
+              }
+            }
+          }
+
+          if (warp_is_parked && ready_for_barrier &&
+              m_warp[warp_id]->m_pending_splits.empty()) {
+            for (auto &s : m_warp[warp_id]->m_splits) {
+              s.at_barrier = false;
+            }
+            const warp_inst_t *parked_inst = m_warp[warp_id]->get_inst_at_barrier(); 
+            assert(parked_inst != NULL);
+            
+            // Access m_warp[warp_id] instead of warp_ptr
+            m_barriers.warp_reaches_barrier(
+                m_warp[warp_id]->get_cta_id(), warp_id, 
+                const_cast<warp_inst_t *>(parked_inst));
+
+            printf(
+                "[DWS-RELEASE] Core: %u | Warp: %u released barrier after "
+                "merge.\n",
+                m_sid, warp_id);
+          }
+        }
+      }
+    }
+  }
+
+  // 3. Stamp split ID and advance PC
+  (*pipe_reg)->set_split_id(issued_split_id);
+  m_warp[warp_id]->set_next_pc(issued_split_id,
+                               next_inst->pc + next_inst->isize);
+
+  // 4. Barrier Logic
+  if (next_inst->op == BARRIER_OP) {
+    m_warp[warp_id]->m_splits[issued_split_id].at_barrier = true;
+
+    // THE FIX: Unconditionally save the barrier instruction the moment we hit
+    // it!
+    m_warp[warp_id]->store_info_of_last_inst_at_barrier(next_inst);
+
+    bool ready_for_barrier = true;
+    for (const auto &split : m_warp[warp_id]->m_splits) {
+      if (split.is_valid && !split.at_barrier) {
+        ready_for_barrier = false;
+        break;
+      }
+    }
+
+    if (ready_for_barrier && m_warp[warp_id]->m_pending_splits.empty()) {
+      // NOTE: We deleted the store_info line from here because we moved it up!
+      m_barriers.warp_reaches_barrier(m_warp[warp_id]->get_cta_id(), warp_id,
+                                      const_cast<warp_inst_t *>(next_inst));
+
+      // Clear flags so they are ready to resume when the CTA releases
+      for (auto &split : m_warp[warp_id]->m_splits) {
+        split.at_barrier = false;
+      }
+    } else {
+      printf(
+          "[DWS-PARK] Core: %u | Cycle: %llu | Warp: %u | Split %u parked at "
+          "barrier. Waiting for queue/laggards.\n",
+          m_sid, m_gpu->gpu_sim_cycle, warp_id, issued_split_id);
+    }
   } else if (next_inst->op == MEMORY_BARRIER_OP) {
     m_warp[warp_id]->set_membar();
   } else if (next_inst->m_is_ldgdepbar) {
@@ -1129,74 +1318,9 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
 
   updateSIMTStack(warp_id, *pipe_reg);
   m_scoreboard->reserveRegisters(*pipe_reg);
-
-  // Find which split actually issued this instruction by matching the PC
-  unsigned issued_split_id = 0;
-  for (auto &split : m_warp[warp_id]->m_splits) {
-    if (split.is_valid && split.pc == next_inst->pc) {
-      issued_split_id = split.split_id;
-      break;
-    }
-  }
-
-  // 1. Stamp the instruction with the issuing split ID for the memory pipeline!
-  (*pipe_reg)->set_split_id(issued_split_id);
-
-  // 2. Update the PC for this specific split
-  m_warp[warp_id]->set_next_pc(issued_split_id,
-                               next_inst->pc + next_inst->isize);
-
-  // 3. Opportunistic Reconvergence Check
-  if (m_warp[warp_id]->m_splits.size() > 1) {
-    for (unsigned i = 0; i < m_warp[warp_id]->m_splits.size(); i++) {
-      if (!m_warp[warp_id]->m_splits[i].is_valid) continue;
-
-      for (unsigned j = i + 1; j < m_warp[warp_id]->m_splits.size(); j++) {
-        if (!m_warp[warp_id]->m_splits[j].is_valid) continue;
-
-        if (m_warp[warp_id]->m_splits[i].pc ==
-            m_warp[warp_id]->m_splits[j].pc) {
-          // Do NOT merge if either split is waiting on memory
-          if (m_warp[warp_id]->m_splits[i].waiting_on_memory ||
-              m_warp[warp_id]->m_splits[j].waiting_on_memory) {
-            continue;
-          }
-
-          // Merge threads into split i
-          m_warp[warp_id]->m_splits[i].active_threads |=
-              m_warp[warp_id]->m_splits[j].active_threads;
-
-          // --- DWS MERGE LOGGING ---
-          printf(
-              "[DWS-MERGE] Core: %u | Cycle: %llu | Warp: %u | Surviving "
-              "Split: %u | "
-              "Killed Split: %u | Merge PC: 0x%llx | Combined Mask: %s\n",
-              m_sid, m_gpu->gpu_sim_cycle, warp_id, i, j,
-              (unsigned long long)m_warp[warp_id]->m_splits[i].pc,
-              m_warp[warp_id]->m_splits[i].active_threads.to_string().c_str());
-
-          // Flush trapped instructions for the dying split J (The Zombie Killer
-          // + Shield)
-          for (unsigned slot = 0; slot < m_warp[warp_id]->ibuffer_get_size();
-               slot++) {
-            if (m_warp[warp_id]->ibuffer_is_valid(slot) &&
-                m_warp[warp_id]->ibuffer_get_split(slot) == j &&
-                m_warp[warp_id]->ibuffer_get_inst(slot) != next_inst) {
-              m_warp[warp_id]->dec_inst_in_pipeline();
-              m_warp[warp_id]->ibuffer_free(slot);
-            }
-          }
-
-          // Kill Split J and scrub its data
-          m_warp[warp_id]->m_splits[j].is_valid = false;
-          m_warp[warp_id]->m_splits[j].active_threads.reset();
-          m_warp[warp_id]->m_splits[j].pc = (address_type)-1;
-        }
-      }
-    }
-  }
   func_exec_inst(**pipe_reg);
 }
+
 void shader_core_ctx::issue() {
   // Ensure fair round robin issu between schedulers
   unsigned j;
@@ -1217,24 +1341,25 @@ shd_warp_t &scheduler_unit::warp(int i) { return *((*m_warp)[i]); }
 /**
  * A general function to order things in a Loose Round Robin way. The simplist
  * use of this function would be to implement a loose RR scheduler between all
- * the warps assigned to this core. A more sophisticated usage would be to order
- * a set of "fetch groups" in a RR fashion. In the first case, the templated
- * class variable would be a simple unsigned int representing the warp_id.  In
- * the 2lvl case, T could be a struct or a list representing a set of warp_ids.
- * @param result_list: The resultant list the caller wants returned.  This list
- * is cleared and then populated in a loose round robin way
+ * the warps assigned to this core. A more sophisticated usage would be to
+ * order a set of "fetch groups" in a RR fashion. In the first case, the
+ * templated class variable would be a simple unsigned int representing the
+ * warp_id.  In the 2lvl case, T could be a struct or a list representing a
+ * set of warp_ids.
+ * @param result_list: The resultant list the caller wants returned.  This
+ * list is cleared and then populated in a loose round robin way
  * @param input_list: The list of things that should be put into the
- * result_list. For a simple scheduler this can simply be the m_supervised_warps
- * list.
+ * result_list. For a simple scheduler this can simply be the
+ * m_supervised_warps list.
  * @param last_issued_from_input:  An iterator pointing the last member in the
  * input_list that issued. Since this function orders in a RR fashion, the
  * object pointed to by this iterator will be last in the prioritization list
  * @param num_warps_to_add: The number of warps you want the scheudler to pick
  * between this cycle. Normally, this will be all the warps availible on the
- * core, i.e. m_supervised_warps.size(). However, a more sophisticated scheduler
- * may wish to limit this number. If the number if < m_supervised_warps.size(),
- * then only the warps with highest RR priority will be placed in the
- * result_list.
+ * core, i.e. m_supervised_warps.size(). However, a more sophisticated
+ * scheduler may wish to limit this number. If the number if <
+ * m_supervised_warps.size(), then only the warps with highest RR priority
+ * will be placed in the result_list.
  */
 template <class T>
 void scheduler_unit::order_lrr(
@@ -1286,14 +1411,14 @@ void scheduler_unit::order_rrr(
 /**
  * A general function to order things in an priority-based way.
  * The core usage of the function is similar to order_lrr.
- * The explanation of the additional parameters (beyond order_lrr) explains the
- * further extensions.
- * @param ordering: An enum that determines how the age function will be treated
- * in prioritization see the definition of OrderingType.
+ * The explanation of the additional parameters (beyond order_lrr) explains
+ * the further extensions.
+ * @param ordering: An enum that determines how the age function will be
+ * treated in prioritization see the definition of OrderingType.
  * @param priority_function: This function is used to sort the input_list.  It
  * is passed to stl::sort as the sorting fucntion. So, if you wanted to sort a
- * list of integer warp_ids with the oldest warps having the most priority, then
- * the priority_function would compare the age of the two warps.
+ * list of integer warp_ids with the oldest warps having the most priority,
+ * then the priority_function would compare the age of the two warps.
  */
 template <class T>
 void scheduler_unit::order_by_priority(
@@ -1397,7 +1522,8 @@ void scheduler_unit::cycle() {
         }
       }
 
-      // If every valid instruction in the buffer belongs to a stalled split, we
+      // If every valid instruction in the buffer belongs to a stalled split,
+      // we
 
       // break
 
@@ -2028,10 +2154,9 @@ unsigned shader_core_ctx::translate_local_memaddr(
     assert(datasize % 4 == 0);  // Must be a multiple of 4B
     num_accesses = datasize / 4;
     assert(num_accesses <= MAX_ACCESSES_PER_INSN_PER_THREAD);  // max 32B
-    assert(
-        localaddr % 4 ==
-        0);  // Address must be 4B aligned - required if accessing 4B per
-             // request, otherwise access will overflow into next thread's space
+    assert(localaddr % 4 == 0);  // Address must be 4B aligned - required if
+                                 // accessing 4B per request, otherwise access
+                                 // will overflow into next thread's space
     for (unsigned i = 0; i < num_accesses; i++) {
       address_type local_word = localaddr / 4 + i;
       address_type linear_address = local_word * max_concurrent_threads * 4 +
@@ -2553,9 +2678,9 @@ bool ldst_unit::constant_cycle(warp_inst_t &inst, mem_stage_stall_type &rc_fail,
     rc_fail = fail;  // keep other fails if this didn't fail.
     fail_type = C_MEM;
     if (rc_fail == BK_CONF or rc_fail == COAL_STALL) {
-      m_stats->gpgpu_n_cmem_portconflict++;  // coal stalls aren't really a bank
-                                             // conflict, but this maintains
-                                             // previous behavior.
+      m_stats->gpgpu_n_cmem_portconflict++;  // coal stalls aren't really a
+                                             // bank conflict, but this
+                                             // maintains previous behavior.
     }
   }
   return inst.accessq_empty();  // done if empty.
@@ -2989,8 +3114,8 @@ ldst_unit::ldst_unit(mem_fetch_interface *icnt,
 void ldst_unit::issue(register_set &reg_set) {
   warp_inst_t *inst = *(reg_set.get_ready());
 
-  // record how many pending register writes/memory accesses there are for this
-  // instruction
+  // record how many pending register writes/memory accesses there are for
+  // this instruction
   assert(inst->empty() == false);
   if (inst->is_load() and inst->space.get_type() != shared_space) {
     unsigned warp_id = inst->warp_id();
@@ -3158,8 +3283,8 @@ void ldst_unit::issue( register_set &reg_set )
    // stat collection
    m_core->mem_instruction_stats(*inst);
 
-   // record how many pending register writes/memory accesses there are for this
-instruction assert(inst->empty() == false); if (inst->is_load() and
+   // record how many pending register writes/memory accesses there are for
+this instruction assert(inst->empty() == false); if (inst->is_load() and
 inst->space.get_type() != shared_space) { unsigned warp_id = inst->warp_id();
       unsigned n_accesses = inst->accessq_count();
       for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
@@ -3207,8 +3332,8 @@ void ldst_unit::cycle() {
         m_response_fifo.pop_front();
         delete mf;
       } else {
-        assert(!mf->get_is_write());  // L1 cache is write evict, allocate line
-                                      // on load miss only
+        assert(!mf->get_is_write());  // L1 cache is write evict, allocate
+                                      // line on load miss only
 
         bool bypassL1D = false;
         if (CACHE_GLOBAL == mf->get_inst().cache_op || (m_L1D == NULL)) {
@@ -3559,8 +3684,8 @@ void gpgpu_sim::shader_print_l1_miss_stat(FILE *fout) const {
   for (unsigned i=0; i<m_shader_config->n_thread_per_shader; i++) {
      temp += m_sc[0]->get_thread_n_l1_mis_ac(i);
      if (i%m_shader_config->warp_size ==
-  (unsigned)(m_shader_config->warp_size-1)) { fprintf(fout, "%d ", temp); temp =
-  0;
+  (unsigned)(m_shader_config->warp_size-1)) { fprintf(fout, "%d ", temp); temp
+  = 0;
      }
   }
   fprintf(fout, "\n");
@@ -3569,8 +3694,8 @@ void gpgpu_sim::shader_print_l1_miss_stat(FILE *fout) const {
   for (unsigned i=0; i<m_shader_config->n_thread_per_shader; i++) {
      temp += (m_sc[0]->get_thread_n_l1_mis_ac(i) -
   m_sc[0]->get_thread_n_l1_mrghit_ac(i) ); if (i%m_shader_config->warp_size ==
-  (unsigned)(m_shader_config->warp_size-1)) { fprintf(fout, "%d ", temp); temp =
-  0;
+  (unsigned)(m_shader_config->warp_size-1)) { fprintf(fout, "%d ", temp); temp
+  = 0;
      }
   }
   fprintf(fout, "\n");
@@ -3579,8 +3704,8 @@ void gpgpu_sim::shader_print_l1_miss_stat(FILE *fout) const {
   for (unsigned i=0; i<m_shader_config->n_thread_per_shader; i++) {
      temp += m_sc[0]->get_thread_n_l1_access_ac(i);
      if (i%m_shader_config->warp_size ==
-  (unsigned)(m_shader_config->warp_size-1)) { fprintf(fout, "%d ", temp); temp =
-  0;
+  (unsigned)(m_shader_config->warp_size-1)) { fprintf(fout, "%d ", temp); temp
+  = 0;
      }
   }
   fprintf(fout, "\n");
@@ -3660,8 +3785,8 @@ void shader_core_ctx::incexecstat(warp_inst_t *&inst) {
       default:
         break;
     }
-    if (inst->const_cache_operand)  // warp has const address space load as one
-                                    // operand
+    if (inst->const_cache_operand)  // warp has const address space load as
+                                    // one operand
       inc_const_accesses(1);
   }
 }
@@ -3730,10 +3855,10 @@ void ldst_unit::print(FILE *fout) const {
   }
   fprintf(fout, "LD/ST wb    = ");
   m_next_wb.print(fout);
-  fprintf(
-      fout,
-      "Last LD/ST writeback @ %llu + %llu (gpu_sim_cycle+gpu_tot_sim_cycle)\n",
-      m_last_inst_gpu_sim_cycle, m_last_inst_gpu_tot_sim_cycle);
+  fprintf(fout,
+          "Last LD/ST writeback @ %llu + %llu "
+          "(gpu_sim_cycle+gpu_tot_sim_cycle)\n",
+          m_last_inst_gpu_sim_cycle, m_last_inst_gpu_tot_sim_cycle);
   fprintf(fout, "Pending register writes:\n");
   std::map<unsigned /*warp_id*/,
            std::map<unsigned /*regnum*/, unsigned /*count*/> >::const_iterator
@@ -3829,10 +3954,10 @@ void shader_core_ctx::display_pipeline(FILE *fout, int print_mem,
   fprintf(fout, "EX/WB      = ");
   print_stage(EX_WB, fout);
   fprintf(fout, "\n");
-  fprintf(
-      fout,
-      "Last EX/WB writeback @ %llu + %llu (gpu_sim_cycle+gpu_tot_sim_cycle)\n",
-      m_last_inst_gpu_sim_cycle, m_last_inst_gpu_tot_sim_cycle);
+  fprintf(fout,
+          "Last EX/WB writeback @ %llu + %llu "
+          "(gpu_sim_cycle+gpu_tot_sim_cycle)\n",
+          m_last_inst_gpu_sim_cycle, m_last_inst_gpu_tot_sim_cycle);
 
   if (m_active_threads.count() <= 2 * m_config->warp_size) {
     fprintf(fout, "Active Threads : ");
@@ -3903,7 +4028,8 @@ unsigned int shader_core_config::max_cta(const kernel_info_t &k) const {
   assert(result <= MAX_CTA_PER_SHADER);
   if (result < 1) {
     printf(
-        "GPGPU-Sim uArch: ERROR ** Kernel requires more resources than shader "
+        "GPGPU-Sim uArch: ERROR ** Kernel requires more resources than "
+        "shader "
         "has.\n");
     if (gpgpu_ignore_resources_limitation) {
       printf(
@@ -4026,8 +4152,8 @@ void shader_core_ctx::cache_invalidate() { m_ldst_unit->invalidate(); }
 // modifiers
 std::list<opndcoll_rfu_t::op_t> opndcoll_rfu_t::arbiter_t::allocate_reads() {
   std::list<op_t>
-      result;  // a list of registers that (a) are in different register banks,
-               // (b) do not go to the same operand collector
+      result;  // a list of registers that (a) are in different register
+               // banks, (b) do not go to the same operand collector
 
   int input;
   int output;
@@ -4079,8 +4205,9 @@ std::list<opndcoll_rfu_t::op_t> opndcoll_rfu_t::arbiter_t::allocate_reads() {
         // Grant!
         _inmatch[input] = output;
         _outmatch[output] = input;
-        // printf("Register File: granting bank %d to OC %d, schedid %d, warpid
-        // %d, Regid %d\n", input, output, (m_queue[input].front()).get_sid(),
+        // printf("Register File: granting bank %d to OC %d, schedid %d,
+        // warpid %d, Regid %d\n", input, output,
+        // (m_queue[input].front()).get_sid(),
         // (m_queue[input].front()).get_wid(),
         // (m_queue[input].front()).get_reg());
       }
@@ -4213,7 +4340,8 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
       }
     }
   } else {
-    // TODO: check on the hardware if the count should include warp that exited
+    // TODO: check on the hardware if the count should include warp that
+    // exited
     if ((at_barrier.count() * m_warp_size) == bar_count) {
       // required number of warps have reached barrier, so release waiting
       // warps...
@@ -4228,8 +4356,8 @@ void barrier_set_t::warp_reaches_barrier(unsigned cta_id, unsigned warp_id,
 
 // warp reaches exit
 void barrier_set_t::warp_exit(unsigned warp_id) {
-  // caller needs to verify all threads in warp are done, e.g., by checking PDOM
-  // stack to see it has only one entry during exit_impl()
+  // caller needs to verify all threads in warp are done, e.g., by checking
+  // PDOM stack to see it has only one entry during exit_impl()
   m_warp_active.reset(warp_id);
 
   // test for barrier release
@@ -4321,7 +4449,8 @@ bool shader_core_ctx::warp_waiting_at_mem_barrier(unsigned warp_id) {
       // Invalidate L1 cache
       // Based on Nvidia Doc, at MEM barrier, we have to
       //(1) wait for all pending writes till they are acked
-      //(2) invalidate L1 cache to ensure coherence and avoid reading stall data
+      //(2) invalidate L1 cache to ensure coherence and avoid reading stall
+      // data
       cache_invalidate();
       // TO DO: you need to stall the SM for 5k cycles.
     }
@@ -4484,8 +4613,8 @@ void shd_warp_t::print_ibuffer(FILE *fout) const {
 
 void opndcoll_rfu_t::add_cu_set(unsigned set_id, unsigned num_cu,
                                 unsigned num_dispatch) {
-  m_cus[set_id].reserve(num_cu);  // this is necessary to stop pointers in m_cu
-                                  // from being invalid do to a resize;
+  m_cus[set_id].reserve(num_cu);  // this is necessary to stop pointers in
+                                  // m_cu from being invalid do to a resize;
   for (unsigned i = 0; i < num_cu; i++) {
     m_cus[set_id].push_back(collector_unit_t());
     m_cu.push_back(&m_cus[set_id].back());
@@ -4640,8 +4769,8 @@ void opndcoll_rfu_t::allocate_cu(unsigned port_num) {
         unsigned cuUpperBound = cu_set.size();
         unsigned schd_id;
         if (sub_core_model) {
-          // Sub core model only allocates on the subset of CUs assigned to the
-          // scheduler that issued
+          // Sub core model only allocates on the subset of CUs assigned to
+          // the scheduler that issued
           unsigned reg_id = (*inp.m_in[i]).get_ready_reg_id();
           schd_id = (*inp.m_in[i]).get_schd_id(reg_id);
           assert(cu_set.size() % m_num_warp_scheds == 0 &&
@@ -4947,8 +5076,8 @@ void simt_core_cluster::icnt_inject_request_packet(class mem_fetch *mf) {
 
   // The packet size varies depending on the type of request:
   // - For write request and atomic request, the packet contains the data
-  // - For read request (i.e. not write nor atomic), the packet only has control
-  // metadata
+  // - For read request (i.e. not write nor atomic), the packet only has
+  // control metadata
   unsigned int packet_size = mf->size();
   if (!mf->get_is_write() && !mf->isatomic()) {
     packet_size = mf->get_ctrl_size();
@@ -5019,8 +5148,8 @@ void sst_simt_core_cluster::icnt_inject_request_packet_to_SST(
 
   // The packet size varies depending on the type of request:
   // - For write request and atomic request, the packet contains the data
-  // - For read request (i.e. not write nor atomic), the packet only has control
-  // metadata
+  // - For read request (i.e. not write nor atomic), the packet only has
+  // control metadata
   unsigned int packet_size = mf->size();
   if (!mf->get_is_write() && !mf->isatomic()) {
     packet_size = mf->get_ctrl_size();

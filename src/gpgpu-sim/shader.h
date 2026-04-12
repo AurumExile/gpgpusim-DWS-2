@@ -45,6 +45,7 @@
 #include <set>
 #include <utility>
 #include <vector>
+#include <queue>
 
 // #include "../cuda-sim/ptx.tab.h"
 
@@ -109,6 +110,7 @@ struct warp_split_t {
       active_threads;      // The threads active in this split
   bool is_valid;           // True if this split is currently alive
   bool waiting_on_memory;  // True if this split is stalled on a cache miss
+  bool at_barrier = false;
 
   warp_split_t()
       : split_id(0), pc(0), is_valid(false), waiting_on_memory(false) {}
@@ -122,6 +124,42 @@ class shd_warp_t {
     m_stores_outstanding = 0;
     m_inst_in_pipeline = 0;
     reset();
+  }
+
+  const warp_inst_t* get_inst_at_barrier() const {
+    return &m_inst_at_barrier;
+  }
+
+  bool is_split_pipeline_empty(unsigned split_id) const {
+    // Check if the I-Buffer is empty for this split
+    for (unsigned i = 0; i < IBUFFER_SIZE; i++) {
+        if (m_ibuffer[i].m_valid && m_ibuffer[i].m_split_id == split_id) return false;
+    }
+    // Note: If the I-Buffer is empty, but m_inst_in_pipeline > 0, it means 
+    // instructions for this split are currently in the Execution Units. 
+    // We cannot safely kill the split until m_inst_in_pipeline == 0.
+    
+    // To be perfectly safe, we require the ENTIRE warp pipeline to drain 
+    // before we allow a split to fully retire, because GPGPU-Sim only tracks 
+    // m_inst_in_pipeline at the warp level, not the split level.
+    if (m_inst_in_pipeline > 0) return false;
+
+    return true;
+  }
+
+  virtual bool is_split_finished(unsigned split_id) const { return false; }
+
+
+  // 2. Create a queue for overflow splits
+  std::queue<warp_split_t> m_pending_splits;
+
+  // 3. Helper to count currently active hardware splits
+  unsigned get_num_active_hw_splits() const {
+    unsigned count = 0;
+    for (const auto &split : m_splits) {
+      if (split.is_valid) count++;
+    }
+    return count;
   }
 
   std::bitset<MAX_WARP_SIZE> get_active_mask() const {
@@ -1755,6 +1793,7 @@ class shader_core_config : public core_config {
   unsigned gpgpu_num_sched_per_core;
   int gpgpu_max_insn_issue_per_warp;
   bool gpgpu_dual_issue_diff_exec_units;
+  unsigned gpgpu_max_hw_splits;
 
   // op collector
   bool enable_specialized_operand_collector;
