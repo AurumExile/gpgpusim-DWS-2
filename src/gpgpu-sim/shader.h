@@ -1967,6 +1967,8 @@ struct shader_core_stats_pod {
   unsigned *gpgpu_n_shmem_bank_access;
   long *n_simt_to_mem;  // Interconnect power stats
   long *n_mem_to_simt;
+  unsigned *gpgpu_n_subwarp_insn_issued; // Total splits issued
+  unsigned *gpgpu_n_warp_issue_cycles;   // Cycles where a warp issued >= 1 split
 };
 
 class shader_core_stats : public shader_core_stats_pod {
@@ -1979,6 +1981,10 @@ class shader_core_stats : public shader_core_stats_pod {
     shader_cycles = (unsigned long long *)calloc(config->num_shader(),
                                                  sizeof(unsigned long long));
     m_num_sim_insn = (unsigned *)calloc(config->num_shader(), sizeof(unsigned));
+    gpgpu_n_subwarp_insn_issued =
+        (unsigned *)calloc(config->num_shader(), sizeof(unsigned));
+    gpgpu_n_warp_issue_cycles =
+        (unsigned *)calloc(config->num_shader(), sizeof(unsigned));
     m_num_sim_winsn =
         (unsigned *)calloc(config->num_shader(), sizeof(unsigned));
     m_last_num_sim_winsn =
@@ -2131,6 +2137,8 @@ class shader_core_stats : public shader_core_stats_pod {
     free(m_n_diverge);
     free(shader_cycle_distro);
     free(last_shader_cycle_distro);
+    free(gpgpu_n_subwarp_insn_issued);
+    free(gpgpu_n_warp_issue_cycles);
   }
 
   void new_grid() {}

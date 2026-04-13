@@ -625,13 +625,23 @@ float shader_core_ctx::get_current_occupancy(unsigned long long &active,
 void shader_core_stats::print(FILE *fout) const {
   unsigned long long thread_icount_uarch = 0;
   unsigned long long warp_icount_uarch = 0;
+  unsigned long long subwarp_icount = 0;
+  unsigned long long warp_issue_cycles = 0;
 
   for (unsigned i = 0; i < m_config->num_shader(); i++) {
     thread_icount_uarch += m_num_sim_insn[i];
     warp_icount_uarch += m_num_sim_winsn[i];
+    subwarp_icount += gpgpu_n_subwarp_insn_issued[i];
+    warp_issue_cycles += gpgpu_n_warp_issue_cycles[i];
   }
   fprintf(fout, "gpgpu_n_tot_thrd_icount = %lld\n", thread_icount_uarch);
   fprintf(fout, "gpgpu_n_tot_w_icount = %lld\n", warp_icount_uarch);
+  fprintf(fout, "gpgpu_n_subwarp_insn_issued = %lld\n", subwarp_icount);
+  fprintf(fout, "gpgpu_n_warp_issue_cycles = %lld\n", warp_issue_cycles);
+  if (warp_issue_cycles > 0) {
+      fprintf(fout, "DWS_Parallelism (Splits_per_Issue_Cycle) = %.4f\n", 
+              (double)subwarp_icount / warp_issue_cycles);
+  }
 
   fprintf(fout, "gpgpu_n_stall_shd_mem = %d\n", gpgpu_n_stall_shd_mem);
   fprintf(fout, "gpgpu_n_mem_read_local = %d\n", gpgpu_n_mem_read_local);
@@ -1493,12 +1503,28 @@ void scheduler_unit::cycle() {
 
     exec_unit_type_t previous_issued_inst_exec_type = exec_unit_type_t::NONE;
 
-    unsigned max_issue = m_shader->m_config->gpgpu_max_insn_issue_per_warp;
+    unsigned active_ready_splits = 0;
+    for (const auto& split : warp(warp_id).m_splits) {
+        if (split.is_valid && !split.waiting_on_memory && !split.at_barrier) {
+            active_ready_splits++;
+        }
+    }
 
+    // Scale max_issue to allow the warp to issue as many instructions as it has ready splits.
+    // (Actual issue is still safely bounded by hardware structural hazards via has_free())
+    unsigned max_issue = m_shader->m_config->gpgpu_max_insn_issue_per_warp;
+    if (active_ready_splits > 1) {
+        max_issue = active_ready_splits * m_shader->m_config->gpgpu_max_insn_issue_per_warp;
+    }
+
+    // If we are issuing from different splits, they represent independent threads.
+    // They should not be penalized by the dual-issue different-execution-unit restriction.
     bool diff_exec_units = m_shader->m_config->gpgpu_dual_issue_diff_exec_units;
+    if (active_ready_splits > 1) {
+        diff_exec_units = false; 
+    }
 
     // --- DWS AWARE ISSUE LOOP ---
-
     while (!warp(warp_id).waiting() && !warp(warp_id).ibuffer_empty() &&
 
            (checked < max_issue) && (checked <= issued) &&
@@ -1928,6 +1954,13 @@ void scheduler_unit::cycle() {
       else
 
         abort();
+
+        // --- DWS STATS UPDATE ---
+      // 1. Increment the issue cycle count by 1 (the warp issued *something*)
+      m_stats->gpgpu_n_warp_issue_cycles[m_shader->get_sid()]++;
+      // 2. Increment total subwarp instruction count by the number of splits issued
+      m_stats->gpgpu_n_subwarp_insn_issued[m_shader->get_sid()] += issued;
+      // ------------------------
 
       break;
     }
