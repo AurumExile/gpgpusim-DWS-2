@@ -1146,179 +1146,191 @@ void exec_shader_core_ctx::func_exec_inst(warp_inst_t &inst) {
 }
 
 void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
-                                 const warp_inst_t *next_inst,
-                                 const active_mask_t &active_mask,
-                                 unsigned warp_id, unsigned sch_id) {
-  warp_inst_t **pipe_reg =
-      pipe_reg_set.get_free(m_config->sub_core_model, sch_id);
-  assert(pipe_reg);
+  const warp_inst_t *next_inst,
+  const active_mask_t &active_mask,
+  unsigned warp_id, unsigned sch_id) {
+warp_inst_t **pipe_reg =
+pipe_reg_set.get_free(m_config->sub_core_model, sch_id);
+assert(pipe_reg);
 
-  **pipe_reg = *next_inst;
-  (*pipe_reg)->set_active(active_mask);
-  (*pipe_reg)->set_scheduler_id(sch_id);
+**pipe_reg = *next_inst;
+(*pipe_reg)->set_active(active_mask);
+(*pipe_reg)->set_scheduler_id(sch_id);
 
-  // 1. Identify which split is physically issuing this instruction
-  unsigned issued_split_id = 0;
-  for (auto &split : m_warp[warp_id]->m_splits) {
-    // A parked split cannot issue. Filter it out to find the true owner.
-    if (split.is_valid && split.pc == next_inst->pc && !split.at_barrier) {
-      issued_split_id = split.split_id;
-      break;
-    }
-  }
+// 1. Identify which split is physically issuing this instruction
+unsigned issued_split_id = next_inst->get_split_id();
 
-  // 2. Opportunistic Reconvergence Check (MUST happen BEFORE the barrier check)
-  if (m_warp[warp_id]->m_splits.size() > 1) {
-    for (unsigned i = 0; i < m_warp[warp_id]->m_splits.size(); i++) {
-      if (!m_warp[warp_id]->m_splits[i].is_valid) continue;
+// 2. Opportunistic Reconvergence Check (MUST happen BEFORE the barrier check)
+if (m_warp[warp_id]->m_splits.size() > 1) {
+for (unsigned i = 0; i < m_warp[warp_id]->m_splits.size(); i++) {
+if (!m_warp[warp_id]->m_splits[i].is_valid) continue;
 
-      for (unsigned j = i + 1; j < m_warp[warp_id]->m_splits.size(); j++) {
-        if (!m_warp[warp_id]->m_splits[j].is_valid) continue;
+for (unsigned j = i + 1; j < m_warp[warp_id]->m_splits.size(); j++) {
+if (!m_warp[warp_id]->m_splits[j].is_valid) continue;
 
-        // --- THE CRITICAL FIX: PC AND TRACE_INDEX MATCH ---
-        // This prevents merging a loop-back (future) with a laggard (past).
-        if (m_warp[warp_id]->m_splits[i].pc ==
-                m_warp[warp_id]->m_splits[j].pc &&
-            m_warp[warp_id]->m_splits[i].trace_index ==
-                m_warp[warp_id]->m_splits[j].trace_index) {
-          if (m_warp[warp_id]->m_splits[i].waiting_on_memory ||
-              m_warp[warp_id]->m_splits[j].waiting_on_memory) {
-            continue;
-          }
+// --- THE CRITICAL FIX: PC AND TRACE_INDEX MATCH ---
+// This prevents merging a loop-back (future) with a laggard (past).
+if (m_warp[warp_id]->m_splits[i].pc ==
+m_warp[warp_id]->m_splits[j].pc &&
+m_warp[warp_id]->m_splits[i].trace_index ==
+m_warp[warp_id]->m_splits[j].trace_index) {
+if (m_warp[warp_id]->m_splits[i].waiting_on_memory ||
+m_warp[warp_id]->m_splits[j].waiting_on_memory) {
+continue;
+}
 
-          // Transfer identity if the issuing split (j) is the one being killed
-          if (issued_split_id == j) issued_split_id = i;
+// Transfer identity if the issuing split (j) is the one being killed
+if (issued_split_id == j) issued_split_id = i;
 
-          // Merge threads from J into I
-          m_warp[warp_id]->m_splits[i].active_threads |=
-              m_warp[warp_id]->m_splits[j].active_threads;
+// Merge threads from J into I
+m_warp[warp_id]->m_splits[i].active_threads |=
+m_warp[warp_id]->m_splits[j].active_threads;
 
-          printf(
-              "[DWS-MERGE] Core: %u | Cycle: %llu | Warp: %u | Surviving: %u | "
-              "Killed: %u | PC: 0x%llx | TraceIdx: %llu\n",
-              m_sid, m_gpu->gpu_sim_cycle, warp_id, i, j,
-              (unsigned long long)m_warp[warp_id]->m_splits[i].pc,
-              (unsigned long long)m_warp[warp_id]->m_splits[i].trace_index);
+printf(
+"[DWS-MERGE] Core: %u | Cycle: %llu | Warp: %u | Surviving: %u | "
+"Killed: %u | PC: 0x%llx | TraceIdx: %llu\n",
+m_sid, m_gpu->gpu_sim_cycle, warp_id, i, j,
+(unsigned long long)m_warp[warp_id]->m_splits[i].pc,
+(unsigned long long)m_warp[warp_id]->m_splits[i].trace_index);
 
-          // Zombie Killer: Clean I-Buffer of references to the killed split J
-          for (unsigned slot = 0; slot < m_warp[warp_id]->ibuffer_get_size();
-               slot++) {
-            if (m_warp[warp_id]->ibuffer_is_valid(slot) &&
-                m_warp[warp_id]->ibuffer_get_split(slot) == j &&
-                m_warp[warp_id]->ibuffer_get_inst(slot) != next_inst) {
-              m_warp[warp_id]->dec_inst_in_pipeline();
-              m_warp[warp_id]->ibuffer_free(slot);
-            }
-          }
+// Zombie Killer: Clean I-Buffer of references to the killed split J
+for (unsigned slot = 0; slot < m_warp[warp_id]->ibuffer_get_size();
+slot++) {
+if (m_warp[warp_id]->ibuffer_is_valid(slot) &&
+m_warp[warp_id]->ibuffer_get_split(slot) == j &&
+m_warp[warp_id]->ibuffer_get_inst(slot) != next_inst) {
+m_warp[warp_id]->dec_inst_in_pipeline();
+m_warp[warp_id]->ibuffer_free(slot);
+}
+}
 
-          // Kill Split J
-          m_warp[warp_id]->m_splits[j].is_valid = false;
-          m_warp[warp_id]->m_splits[j].active_threads.reset();
-          m_warp[warp_id]->m_splits[j].pc = (address_type)-1;
-          m_warp[warp_id]->m_splits[j].at_barrier = false;
+// Kill Split J
+m_warp[warp_id]->m_splits[j].is_valid = false;
+m_warp[warp_id]->m_splits[j].active_threads.reset();
+m_warp[warp_id]->m_splits[j].pc = (address_type)-1;
+m_warp[warp_id]->m_splits[j].at_barrier = false;
 
-          // Wake-up logic for queued splits
-          if (!m_warp[warp_id]->m_pending_splits.empty()) {
-            warp_split_t queued = m_warp[warp_id]->m_pending_splits.front();
-            m_warp[warp_id]->m_pending_splits.pop();
-            m_warp[warp_id]->spawn_split(j, queued.pc, queued.trace_index,
-                                         queued.active_threads);
-            printf(
-                "[DWS-WAKE] Core: %u | Cycle: %llu | Warp: %u popped queued "
-                "split into slot %u.\n",
-                m_sid, m_gpu->gpu_sim_cycle, warp_id, j);
-          }
+// Wake-up logic for queued splits
+if (!m_warp[warp_id]->m_pending_splits.empty()) {
+warp_split_t queued = m_warp[warp_id]->m_pending_splits.front();
+m_warp[warp_id]->m_pending_splits.pop();
+m_warp[warp_id]->spawn_split(j, queued.pc, queued.trace_index,
+          queued.active_threads);
+printf(
+"[DWS-WAKE] Core: %u | Cycle: %llu | Warp: %u popped queued "
+"split into slot %u.\n",
+m_sid, m_gpu->gpu_sim_cycle, warp_id, j);
+}
 
-          // --- THE FIX: Re-evaluate Barrier after a merge ---
-          bool warp_is_parked = false;
-          bool ready_for_barrier = true;
-          address_type parked_pc = (address_type)-1;
+// --- THE FIX: Re-evaluate Barrier after a merge ---
+bool warp_is_parked = false;
+bool ready_for_barrier = true;
+address_type parked_pc = (address_type)-1;
 
-          for (const auto &s : m_warp[warp_id]->m_splits) {
-            if (s.is_valid) {
-              if (s.at_barrier) {
-                warp_is_parked = true;
-                parked_pc = s.pc;
-              } else {
-                ready_for_barrier = false;
-              }
-            }
-          }
+for (const auto &s : m_warp[warp_id]->m_splits) {
+if (s.is_valid) {
+if (s.at_barrier) {
+warp_is_parked = true;
+parked_pc = s.pc;
+} else {
+ready_for_barrier = false;
+}
+}
+}
 
-          if (warp_is_parked && ready_for_barrier &&
-              m_warp[warp_id]->m_pending_splits.empty()) {
-            for (auto &s : m_warp[warp_id]->m_splits) {
-              s.at_barrier = false;
-            }
-            const warp_inst_t *parked_inst = m_warp[warp_id]->get_inst_at_barrier(); 
-            assert(parked_inst != NULL);
-            
-            // Access m_warp[warp_id] instead of warp_ptr
-            m_barriers.warp_reaches_barrier(
-                m_warp[warp_id]->get_cta_id(), warp_id, 
-                const_cast<warp_inst_t *>(parked_inst));
+if (warp_is_parked && ready_for_barrier &&
+m_warp[warp_id]->m_pending_splits.empty()) {
+for (auto &s : m_warp[warp_id]->m_splits) {
+s.at_barrier = false;
+}
+const warp_inst_t *parked_inst = m_warp[warp_id]->get_inst_at_barrier(); 
+assert(parked_inst != NULL);
 
-            printf(
-                "[DWS-RELEASE] Core: %u | Warp: %u released barrier after "
-                "merge.\n",
-                m_sid, warp_id);
-          }
-        }
-      }
-    }
-  }
+// Access m_warp[warp_id] instead of warp_ptr
+m_barriers.warp_reaches_barrier(
+m_warp[warp_id]->get_cta_id(), warp_id, 
+const_cast<warp_inst_t *>(parked_inst));
 
-  // 3. Stamp split ID and advance PC
-  (*pipe_reg)->set_split_id(issued_split_id);
-  m_warp[warp_id]->set_next_pc(issued_split_id,
-                               next_inst->pc + next_inst->isize);
+printf(
+"[DWS-RELEASE] Core: %u | Warp: %u released barrier after "
+"merge.\n",
+m_sid, warp_id);
+}
+}
+}
+}
+}
 
-  // 4. Barrier Logic
-  if (next_inst->op == BARRIER_OP) {
-    m_warp[warp_id]->m_splits[issued_split_id].at_barrier = true;
+// 3. Stamp split ID and advance PC
+(*pipe_reg)->set_split_id(issued_split_id);
+m_warp[warp_id]->set_next_pc(issued_split_id,
+next_inst->pc + next_inst->isize);
 
-    // THE FIX: Unconditionally save the barrier instruction the moment we hit
-    // it!
-    m_warp[warp_id]->store_info_of_last_inst_at_barrier(next_inst);
+// 4. Barrier Logic
+if (next_inst->op == BARRIER_OP) {
+m_warp[warp_id]->m_splits[issued_split_id].at_barrier = true;
 
-    bool ready_for_barrier = true;
-    for (const auto &split : m_warp[warp_id]->m_splits) {
-      if (split.is_valid && !split.at_barrier) {
-        ready_for_barrier = false;
-        break;
-      }
-    }
+// THE FIX: Unconditionally save the barrier instruction the moment we hit it!
+m_warp[warp_id]->store_info_of_last_inst_at_barrier(next_inst);
 
-    if (ready_for_barrier && m_warp[warp_id]->m_pending_splits.empty()) {
-      // NOTE: We deleted the store_info line from here because we moved it up!
-      m_barriers.warp_reaches_barrier(m_warp[warp_id]->get_cta_id(), warp_id,
-                                      const_cast<warp_inst_t *>(next_inst));
+bool ready_for_barrier = true;
+for (const auto &split : m_warp[warp_id]->m_splits) {
+if (split.is_valid && !split.at_barrier) {
+ready_for_barrier = false;
+break;
+}
+}
 
-      // Clear flags so they are ready to resume when the CTA releases
-      for (auto &split : m_warp[warp_id]->m_splits) {
-        split.at_barrier = false;
-      }
-    } else {
-      printf(
-          "[DWS-PARK] Core: %u | Cycle: %llu | Warp: %u | Split %u parked at "
-          "barrier. Waiting for queue/laggards.\n",
-          m_sid, m_gpu->gpu_sim_cycle, warp_id, issued_split_id);
-    }
-  } else if (next_inst->op == MEMORY_BARRIER_OP) {
-    m_warp[warp_id]->set_membar();
-  } else if (next_inst->m_is_ldgdepbar) {
-    m_warp[warp_id]->m_ldgdepbar_id = next_inst->m_depbar_group_no;
-    m_warp[warp_id]->m_ldgdepbar_buf.push_back(std::vector<warp_inst_t>());
-  } else if (next_inst->m_is_depbar) {
-    m_warp[warp_id]->m_depbar_start_id =
-        m_warp[warp_id]->m_ldgdepbar_buf.size() - next_inst->m_depbar_group_no;
-    m_warp[warp_id]->m_depbar_group = next_inst->m_depbar_group_no;
-    m_warp[warp_id]->m_waiting_ldgsts = true;
-  }
+if (ready_for_barrier && m_warp[warp_id]->m_pending_splits.empty()) {
+m_barriers.warp_reaches_barrier(m_warp[warp_id]->get_cta_id(), warp_id,
+       const_cast<warp_inst_t *>(next_inst));
 
-  updateSIMTStack(warp_id, *pipe_reg);
-  m_scoreboard->reserveRegisters(*pipe_reg);
-  func_exec_inst(**pipe_reg);
+// Clear flags so they are ready to resume when the CTA releases
+for (auto &split : m_warp[warp_id]->m_splits) {
+split.at_barrier = false;
+}
+} else {
+printf(
+"[DWS-PARK] Core: %u | Cycle: %llu | Warp: %u | Split %u parked at "
+"barrier. Waiting for queue/laggards.\n",
+m_sid, m_gpu->gpu_sim_cycle, warp_id, issued_split_id);
+
+// ---> THE FIX: WAKE UP A QUEUED SPLIT TO TAKE THIS HW SLOT <---
+if (!m_warp[warp_id]->m_pending_splits.empty()) {
+warp_split_t queued = m_warp[warp_id]->m_pending_splits.front();
+m_warp[warp_id]->m_pending_splits.pop();
+
+// Find an empty slot in the physical m_splits array
+unsigned new_slot = m_warp[warp_id]->m_splits.size();
+for (unsigned i = 0; i < m_warp[warp_id]->m_splits.size(); i++) {
+if (!m_warp[warp_id]->m_splits[i].is_valid) {
+new_slot = i;
+break;
+}
+}
+
+m_warp[warp_id]->spawn_split(new_slot, queued.pc, queued.trace_index,
+      queued.active_threads);
+      
+printf("[DWS-SWAP] Core: %u | Cycle: %llu | Warp: %u | Parked split %u yielded HW slot to queued PC: 0x%llx\n",
+m_sid, m_gpu->gpu_sim_cycle, warp_id, issued_split_id, (unsigned long long)queued.pc);
+}
+}
+} else if (next_inst->op == MEMORY_BARRIER_OP) {
+m_warp[warp_id]->set_membar();
+} else if (next_inst->m_is_ldgdepbar) {
+m_warp[warp_id]->m_ldgdepbar_id = next_inst->m_depbar_group_no;
+m_warp[warp_id]->m_ldgdepbar_buf.push_back(std::vector<warp_inst_t>());
+} else if (next_inst->m_is_depbar) {
+m_warp[warp_id]->m_depbar_start_id =
+m_warp[warp_id]->m_ldgdepbar_buf.size() - next_inst->m_depbar_group_no;
+m_warp[warp_id]->m_depbar_group = next_inst->m_depbar_group_no;
+m_warp[warp_id]->m_waiting_ldgsts = true;
+}
+
+updateSIMTStack(warp_id, *pipe_reg);
+m_scoreboard->reserveRegisters(*pipe_reg);
+func_exec_inst(**pipe_reg);
 }
 
 void shader_core_ctx::issue() {
@@ -1536,6 +1548,8 @@ void scheduler_unit::cycle() {
       const warp_inst_t *pI = warp(warp_id).ibuffer_get_inst(issue_slot);
 
       unsigned next_split_id = warp(warp_id).ibuffer_get_split(issue_slot);
+
+      const_cast<warp_inst_t *>(pI)->set_split_id(next_split_id);
 
       // CDP Support
 
@@ -2448,7 +2462,7 @@ mem_stage_stall_type ldst_unit::process_cache_access(
       master_warp->m_splits[current_split_id].active_threads &=
           ~missing_threads;
 
-      inst.clear_active(missing_threads);
+      //inst.clear_active(missing_threads);
     } else {
       // ALL threads in this split missed
       master_warp->m_splits[current_split_id].waiting_on_memory = true;
@@ -2584,10 +2598,15 @@ void ldst_unit::L1_latency_queue_cycle() {
                     mf_next->get_inst().warp_id(), mf_next->get_inst().out[r],
                     mf_next->get_inst().get_active_mask());
 
-                unsigned returning_split_id = m_next_wb.get_split_id();
-                m_core->m_warp[mf_next->get_inst().warp_id()]
-                    ->m_splits[returning_split_id]
-                    .waiting_on_memory = false;
+                //unsigned returning_split_id = m_next_wb.get_split_id();
+               // m_core->m_warp[mf_next->get_inst().warp_id()]
+                    //->m_splits[returning_split_id]
+                   // .waiting_on_memory = false;
+                   for (auto &split : m_core->m_warp[mf_next->get_inst().warp_id()]->m_splits) {
+                    if (split.is_valid && split.waiting_on_memory && split.pc == mf_next->get_inst().pc) {
+                        split.waiting_on_memory = false;
+                    }
+                }
 
                 m_core->warp_inst_complete(mf_next->get_inst());
               }
@@ -3156,13 +3175,20 @@ void ldst_unit::writeback() {
                                             m_next_wb.get_active_mask());
 
               // DWS Wake up with safety bounds check
-              unsigned returning_split_id = m_next_wb.get_split_id();
-              if (returning_split_id <
-                  m_core->m_warp[m_next_wb.warp_id()]->m_splits.size()) {
-                m_core->m_warp[m_next_wb.warp_id()]
-                    ->m_splits[returning_split_id]
-                    .waiting_on_memory = false;
+             // unsigned returning_split_id = m_next_wb.get_split_id();
+             // if (returning_split_id <
+              //    m_core->m_warp[m_next_wb.warp_id()]->m_splits.size()) {
+             //   m_core->m_warp[m_next_wb.warp_id()]
+              //      ->m_splits[returning_split_id]
+              //      .waiting_on_memory = false;
+             // }
+
+             for (auto &split : m_core->m_warp[m_next_wb.warp_id()]->m_splits) {
+              if (split.is_valid && split.waiting_on_memory && split.pc == m_next_wb.pc) {
+                  split.waiting_on_memory = false;
               }
+          }
+
               insn_completed = true;
             }
           } else {  // shared
@@ -3170,13 +3196,18 @@ void ldst_unit::writeback() {
                                           m_next_wb.get_active_mask());
 
             // DWS Wake up with safety bounds check
-            unsigned returning_split_id = m_next_wb.get_split_id();
-            if (returning_split_id <
-                m_core->m_warp[m_next_wb.warp_id()]->m_splits.size()) {
-              m_core->m_warp[m_next_wb.warp_id()]
-                  ->m_splits[returning_split_id]
-                  .waiting_on_memory = false;
+           // unsigned returning_split_id = m_next_wb.get_split_id();
+           // if (returning_split_id <
+           //     m_core->m_warp[m_next_wb.warp_id()]->m_splits.size()) {
+           //   m_core->m_warp[m_next_wb.warp_id()]
+            //      ->m_splits[returning_split_id]
+            //      .waiting_on_memory = false;
+           // }
+           for (auto &split : m_core->m_warp[m_next_wb.warp_id()]->m_splits) {
+            if (split.is_valid && split.waiting_on_memory && split.pc == m_next_wb.pc) {
+                split.waiting_on_memory = false;
             }
+        }
             insn_completed = true;
           }
         } else if (m_next_wb.m_is_ldgsts) {  // for LDGSTS instructions

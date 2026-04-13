@@ -31,46 +31,43 @@ void Scoreboard::printContents() const {
 
 // DWS: Reserve Register per-thread
 void Scoreboard::reserveRegister(unsigned wid, unsigned regnum,
-  const active_mask_t &mask) {
-// If the register isn't locked at all yet, initialize it
-if (reg_table[wid].find(regnum) == reg_table[wid].end()) {
-reg_table[wid][regnum] = mask;
-} else {
-// If it is locked, ensure the exact same threads aren't trying to lock it again
-if ((reg_table[wid][regnum] & mask).any()) {
-printf(
-"Error: trying to reserve an already reserved register by same "
-"threads (sid=%d, wid=%d, regnum=%d).\n",
-m_sid, wid, regnum);
-abort();
-}
-// Bitwise OR to add these threads to the lock
-reg_table[wid][regnum] |= mask;
-}
-SHADER_DPRINTF(SCOREBOARD, "Reserved Register - warp:%d, reg: %d, mask: %s\n",
-wid, regnum, mask.to_string().c_str());
+                                 const active_mask_t &mask) {
+  // If the register isn't locked at all yet, initialize it
+  if (reg_table[wid].find(regnum) == reg_table[wid].end()) {
+    reg_table[wid][regnum] = mask;
+  } else {
+    // If it is locked, ensure the exact same threads aren't trying to lock it
+    // again
+    if ((reg_table[wid][regnum] & mask).any()) {
+      printf(
+          "Error: trying to reserve an already reserved register by same "
+          "threads (sid=%d, wid=%d, regnum=%d).\n",
+          m_sid, wid, regnum);
+      abort();
+    }
+    // Bitwise OR to add these threads to the lock
+    reg_table[wid][regnum] |= mask;
+  }
+  SHADER_DPRINTF(SCOREBOARD, "Reserved Register - warp:%d, reg: %d, mask: %s\n",
+                 wid, regnum, mask.to_string().c_str());
 }
 
 // DWS: Unmark register as write-pending per-thread
 void Scoreboard::releaseRegister(unsigned wid, unsigned regnum,
-  const active_mask_t &mask) {
-if (reg_table[wid].find(regnum) == reg_table[wid].end()) return;
+                                 const active_mask_t &mask) {
+  if (reg_table[wid].find(regnum) == reg_table[wid].end()) return;
 
-// Bitwise AND NOT to clear only the threads that just finished
-reg_table[wid][regnum] &= ~(mask);
+  // DWS FIX: Instead of bitwise clearing, just nuke the lock entirely
+  // because the instruction is fully complete.
+  reg_table[wid].erase(regnum);
 
-SHADER_DPRINTF(SCOREBOARD,
-"Release register - warp:%d, reg: %d, mask freed: %s\n", wid,
-regnum, mask.to_string().c_str());
-
-// If no threads are locking this register anymore, erase it from the map
-if (reg_table[wid][regnum].none()) {
-reg_table[wid].erase(regnum);
+  SHADER_DPRINTF(SCOREBOARD,
+                 "Release register - warp:%d, reg: %d (DWS Force Cleared)\n",
+                 wid, regnum);
 }
-}
-
 // DWS: Check long op status
-const bool Scoreboard::islongop(unsigned warp_id, unsigned regnum, const active_mask_t &mask) {
+const bool Scoreboard::islongop(unsigned warp_id, unsigned regnum,
+                                const active_mask_t &mask) {
   if (longopregs[warp_id].find(regnum) != longopregs[warp_id].end()) {
     return (longopregs[warp_id][regnum] & mask).any();
   }
@@ -84,9 +81,11 @@ void Scoreboard::reserveRegisters(const class warp_inst_t *inst) {
   for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
     if (inst->out[r] > 0) {
       reserveRegister(inst->warp_id(), inst->out[r], mask);
-      
-      // FIX: Mask format string specifier updated to %s to prevent segmentation fault
-      SHADER_DPRINTF(SCOREBOARD, "Reserved register - warp:%d, reg: %d, mask: %s\n",
+
+      // FIX: Mask format string specifier updated to %s to prevent segmentation
+      // fault
+      SHADER_DPRINTF(SCOREBOARD,
+                     "Reserved register - warp:%d, reg: %d, mask: %s\n",
                      inst->warp_id(), inst->out[r], mask.to_string().c_str());
     }
   }
