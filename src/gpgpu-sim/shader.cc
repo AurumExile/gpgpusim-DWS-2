@@ -1946,6 +1946,63 @@ void scheduler_unit::cycle() {
   else if (!issued_inst)
 
     m_stats->shader_cycle_distro[2]++;
+
+    if (!issued_inst) { 
+      // Optional: You might want to sample this instead of printing every cycle, 
+      // but it's good to prove it's hitting.
+      printf("[DWS-STARVED] Core: %u | Cycle: %llu | Scheduler %u has no ready instructions.\n", 
+             m_shader->get_sid(), m_shader->get_gpu()->gpu_sim_cycle, m_id);
+  }
+
+    // --- DWS REVIVESPLIT LOGIC ---
+  if (true) { // The pipeline is completely starved
+    for (shd_warp_t *warp_ptr : m_supervised_warps) {
+      if (warp_ptr->done_exit()) continue;
+
+      bool revived = false;
+      for (unsigned i = 0; i < warp_ptr->m_splits.size(); i++) {
+        auto &split = warp_ptr->m_splits[i];
+        
+        if (split.is_valid && split.waiting_on_memory) {
+          // Calculate the threads in this split that DID NOT miss the cache
+          active_mask_t hit_threads = split.active_threads & ~split.missed_threads;
+
+          if (hit_threads.any()) {
+            unsigned max_splits = m_shader->get_config()->gpgpu_max_hw_splits;
+            
+            // Only revive if we haven't hit the hardware limit
+            if (warp_ptr->get_num_active_hw_splits() < max_splits) {
+              unsigned new_split_id = warp_ptr->m_splits.size();
+              for (unsigned j = 0; j < warp_ptr->m_splits.size(); j++) {
+                if (!warp_ptr->m_splits[j].is_valid) {
+                  new_split_id = j;
+                  break;
+                }
+              }
+
+              // Spawn the hit-threads to run ahead
+              warp_ptr->spawn_split(new_split_id, split.pc, split.trace_index, hit_threads);
+              warp_ptr->m_splits[new_split_id].waiting_on_memory = false;
+              warp_ptr->m_splits[new_split_id].missed_threads.reset();
+
+              // The original split keeps the missed threads and stays parked
+              split.active_threads &= ~hit_threads;
+
+              printf("[DWS-SPAWN-MEM] Core: %u | Cycle: %llu | Warp: %u | Revived Split %u into %u\n",
+                m_shader->get_sid(), m_shader->get_gpu()->gpu_sim_cycle, warp_ptr->get_warp_id(), i, new_split_id);
+
+              printf("[DWS-REVIVE] Core: %u | Cycle: %llu | Warp: %u | Revived Split %u into %u\n",
+                     m_shader->get_sid(), m_shader->get_gpu()->gpu_sim_cycle, warp_ptr->get_warp_id(), i, new_split_id);
+
+              revived = true;
+              break; // Only revive one split per cycle
+            }
+          }
+        }
+      }
+      if (revived) break; // If we revived something, let the next cycle handle it
+    }
+  }
 }
 
 void scheduler_unit::do_on_warp_issued(
@@ -2441,33 +2498,8 @@ mem_stage_stall_type ldst_unit::process_cache_access(
 
     active_mask_t missing_threads = mf->get_access_warp_mask();
 
-    // Check if this is a PARTIAL miss for the split (Memory Divergence)
-    if (missing_threads !=
-        master_warp->m_splits[current_split_id].active_threads) {
-      unsigned new_split_id = master_warp->m_splits.size();
-      for (unsigned i = 0; i < master_warp->m_splits.size(); i++) {
-        if (!master_warp->m_splits[i].is_valid) {
-          new_split_id = i;
-          break;
-        }
-      }
-
-      unsigned current_split_id = inst.get_split_id();
-      unsigned current_trace_idx = master_warp->m_splits[current_split_id]
-                                       .trace_index;  // Get current index
-
-      master_warp->spawn_split(new_split_id, inst.pc, current_trace_idx,
-                               missing_threads);
-      master_warp->m_splits[new_split_id].waiting_on_memory = true;
-      master_warp->m_splits[current_split_id].active_threads &=
-          ~missing_threads;
-
-      //inst.clear_active(missing_threads);
-    } else {
-      // ALL threads in this split missed
-      master_warp->m_splits[current_split_id].waiting_on_memory = true;
-    }
-    // -----------------------------------
+    master_warp->m_splits[current_split_id].waiting_on_memory = true;
+    master_warp->m_splits[current_split_id].missed_threads |= missing_threads;
 
     inst.accessq_pop_back();
   }
@@ -2605,6 +2637,7 @@ void ldst_unit::L1_latency_queue_cycle() {
                    for (auto &split : m_core->m_warp[mf_next->get_inst().warp_id()]->m_splits) {
                     if (split.is_valid && split.waiting_on_memory && split.pc == mf_next->get_inst().pc) {
                         split.waiting_on_memory = false;
+                        split.missed_threads.reset();
                     }
                 }
 
@@ -3186,6 +3219,7 @@ void ldst_unit::writeback() {
              for (auto &split : m_core->m_warp[m_next_wb.warp_id()]->m_splits) {
               if (split.is_valid && split.waiting_on_memory && split.pc == m_next_wb.pc) {
                   split.waiting_on_memory = false;
+                  split.missed_threads.reset();
               }
           }
 
@@ -3206,6 +3240,7 @@ void ldst_unit::writeback() {
            for (auto &split : m_core->m_warp[m_next_wb.warp_id()]->m_splits) {
             if (split.is_valid && split.waiting_on_memory && split.pc == m_next_wb.pc) {
                 split.waiting_on_memory = false;
+                split.missed_threads.reset();
             }
         }
             insn_completed = true;

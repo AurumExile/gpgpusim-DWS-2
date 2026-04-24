@@ -112,6 +112,8 @@ struct warp_split_t {
   bool waiting_on_memory;  // True if this split is stalled on a cache miss
   bool at_barrier = false;
 
+  std::bitset<MAX_WARP_SIZE> missed_threads;
+
   warp_split_t()
       : split_id(0), pc(0), is_valid(false), waiting_on_memory(false) {}
 };
